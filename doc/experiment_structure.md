@@ -1,5 +1,18 @@
 # Experiment Structure
 
+## When to use this file
+Use this file when:
+- understanding the overall experimental design
+- determining how many sessions, runs, and tasks exist
+- identifying which tasks occur in each session
+- calculating expected number of runs or trials per session
+- planning analyses that depend on session structure (e.g., early vs late sessions, training vs decoding phases)
+
+Do NOT use this file for:
+- locating files on disk (see file_structure.md)
+- parsing file contents or column meanings (see file_contents.md)
+- interpreting trigger codes or computing timing (see triggers.md)
+
 ## Overview
 
 The experiment consists of **5 in-person sessions per subject**, conducted across multiple days. Each session contains a fixed sequence of tasks, with specific numbers of runs per task. Each run consists of a fixed number of trials depending on the task type.
@@ -90,5 +103,5 @@ Each of these sessions includes:
 ## Key Structural Notes
 
 - Each **run is independent** and consists of a fixed number of trials.
-- Practice runs are included to familiarize participants with the task before real runs. They are not included in analyses.
+- Practice runs should be excluded by default from all analyses.
 - Sessions 2–4 focus exclusively on **decoding**, while Sessions 1 and 5 include a broader set of tasks (training, Stroop, calibration).

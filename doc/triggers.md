@@ -156,13 +156,39 @@ If this pattern breaks, data may be corrupted or misaligned.
 
 ---
 
-## 11. Important Consistency Notes
+## 11. Sequence and Trial-Number Validation
 
-- Triggers in `.triggers.txt` and EEG Status channel should match exactly
-- Always verify:
-  - correct number of triggers per run
-  - expected sequence structure
-- RT computation should always use **trigger timing**, not behavioral logs
+Parsing code should validate trigger files using both the **trial number column** and the **expected trigger sequence**. Do not assume that grouping every 3 consecutive rows (or every 2 consecutive rows for EOG) is sufficient without checking trial-number consistency.
+
+### Training / Decoding
+For each trial number, exactly 3 trigger rows are expected, in this order:
+
+1. `4` = fixation  
+2. `8`, `32`, or `44` = stimulus / condition  
+3. `64` = response  
+
+Expected sequence per trial:
+
+`[4 → (8 | 32 | 44) → 64]`
+
+### EOG Calibration
+For each trial number, exactly 2 trigger rows are expected, in this order:
+
+1. `4` = fixation  
+2. `8`, `32`, `44`, or `64` = dot position  
+
+Expected sequence per trial:
+
+`[4 → (8 | 32 | 44 | 64)]`
+
+### Required checks
+Code should verify all of the following:
+- rows for a given trial share the same trial number
+- trial numbers increase in the expected order
+- each trial has the expected number of trigger rows
+- trigger codes follow the correct task-specific sequence
+
+If these checks fail, the file should be treated as misaligned, incomplete, or corrupted rather than parsed silently.
 
 ---
 

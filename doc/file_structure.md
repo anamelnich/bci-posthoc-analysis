@@ -16,7 +16,7 @@ Do NOT use this file for:
 
 All data are stored under:
 
-Box/CNBI/Attention_distraction/project_healthy
+path = `/Users/hililbby/Library/CloudStorage/Box-Box/CNBI/Attention_distraction/project_healthy`
 
 The structure follows:
 
@@ -79,22 +79,6 @@ Not all task types include all file types.
 
 ---
 
-## Session-Level Extra Files
-
-Some sessions contain additional files directly inside the session folder (not inside run folders).
-
-### Session 1
-
-- demographics file  
-- color test file  
-- NASA-TLX file  
-
-### Session 2
-
-- NASA-TLX file  
-
----
-
 ## Decoder Files
 
 Located in:
@@ -120,28 +104,33 @@ Contains:
 - threshold logs (`*_thrlog.mat`)
 - online posterior files (`*_OnlinePosteriors_*.mat`)
 
----
+## Session-Level Extra Files
 
-## Session and Run Distribution
+Some files are stored directly inside the session folder rather than inside individual run folders.
 
 ### Session 1
-- stroop_practice: 1 run
-- stroop: 2 runs
-- EOGcalibration: 1 run
-- training_practice: 1 run
-- training: 8 runs
-- decoding_practice: 1 run
-- decoding: 6 runs
 
-### Sessions 2–4
-- EOGcalibration: 1 run
-- decoding_practice: 1 run
-- decoding: 8 runs
+Session 1 contains the following extra files:
 
-### Session 5
-- EOGcalibration: 1 run
-- decoding_practice: 1 run
-- decoding: 6 runs
-- training: 4 runs
-- stroop_practice: 1 run
-- stroop: 2 runs
+- **Demographics**
+  - Filename format: `demographics_subjectID_date_time.txt`
+  - Example: `demographics_subject39_20260303_090523.txt`
+
+- **Color test**
+  - Filename format: `colortest_subjectID_date_time.txt`
+  - Example: `colortest_subject39_20260303_090811.txt`
+
+- **NASA-TLX**
+  - Filename format: `NASAtli_subjectID_date_time.txt`
+  - Example: `NASAtli_subject36_20260207_155327.txt`
+
+### Session 2
+
+Session 2 also contains:
+
+- **NASA-TLX**
+  - Filename format: `NASAtli_subjectID_date_time.txt`
+
+### Other Sessions
+
+No other session-level extra files are currently documented here.
