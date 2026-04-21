@@ -87,7 +87,7 @@ RT is computed using trigger timestamps:
 
 `RT (samples) = time_response - time_stimulus`
 
-- Convert to milliseconds:
+- Convert to milliseconds (fsamp=512):
 
 `RT (ms) = (RT_samples / fsamp) * 1000`
 

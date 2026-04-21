@@ -122,6 +122,7 @@ Use the following files depending on the task:
 - Do not recompute xDAWN filters, normalization, or feature selection for decoding-session inference; use the saved transforms from the decoder.
 - Treat `baseline_idx` and `resample.time` as relative to epoch indexing with time 0 at `epochOnset`.
 - Keep trial alignment explicit across all preprocessing and feature-extraction steps.
+- **Always validate file integrity**: Use comprehensive validation for all loaded files to ensure data quality and catch issues early.
 
 ## Statistical analysis guidance
 
@@ -163,6 +164,79 @@ When implementing plotting code:
 - default to publication-quality output
 - use consistent panel labeling, axis formatting, and legend logic across figures
 - save figures in high-quality formats appropriate for later editing or manuscript use
+
+## Preferred Workflow
+
+My preferred workflow:
+- All reusable analysis code must live in `src/`.
+- Any new analysis or plot request should be implemented as one or more reusable Python functions/modules in `src/`.
+- After writing the function(s) in `src/`, update the notebook `notebooks/posthoc_analysis.ipynb` by appending a new section for that analysis.
+- Keep adding new sections to this same notebook over time rather than creating separate notebooks.
+
+Notebook rules:
+- The notebook must contain only runnable analysis cells and markdown explanations.
+- Do NOT copy function definitions into the notebook.
+- The notebook should import functions from `src` and run them there.
+- Cells should be written so they chain naturally from previous cells.
+- Outputs and variables created in earlier notebook cells should be reused as inputs for later cells whenever appropriate.
+- No demo/example cell is needed.
+- Each new analysis should be added as a new section at the end of the notebook.
+
+Structure for each new notebook section:
+1. A short markdown cell describing the goal of the new analysis step
+2. An import cell for any newly added functions from `src`
+3. One or more runnable analysis cells that use the existing notebook state when appropriate
+4. Output/inspection cells only where needed to verify correctness
+
+Validation requirements:
+- Every new function added to `src` must include explicit sanity checks and informative printed summaries.
+- These checks should validate relevant expectations from the repository documentation and markdown files I provide.
+- Before implementing a function, read the relevant markdown documentation (including `AGENTS.md` and other data/decoder documentation files) and use that information to guide assumptions and checks.
+- Validate things such as, when relevant:
+  - expected data dimensions/shapes
+  - expected session/run/trial counts
+  - required columns or fields
+  - alignment between arrays/tables
+  - time windows and sampling assumptions
+  - preprocessing assumptions
+- **File loading functions must include comprehensive validation**:
+  - **Trigger files**: Validate row count (180 for training), column structure, trial numbering (1-60), trigger sequences ([4, stimulus, 64]), and data types
+  - **Analysis files**: Validate row count (60 for training), column structure, trial indices (1-60), value ranges for all columns (task: 0-1, feedback: 1-3, positions: valid ranges, etc.)
+  - **Experiment structure**: Validate file counts match expected runs per session (8 in session 1, 4 in session 5 for training)
+  - **Data integrity**: Check for missing files, malformed data, and consistency between related files
+  - **Error reporting**: Provide detailed error messages that help identify specific issues and affected files
+  - **Existing functions**: `load_training_trigger_file()` and `load_training_analysis_file()` already implement this level of validation
+  - **New functions**: Any new file loading functions (e.g., for .mat decoder files, .behoutput.txt Stroop files, etc.) must include equivalent comprehensive validation
+- Use `validate_all_files_comprehensive()` for thorough validation of all data files against documentation specifications
+- If documentation and actual code/data do not fully match, do not silently guess. Make the safest minimal assumption, surface it clearly in prints/comments, and keep the code modular.
+
+Code style:
+- Reusable logic belongs in `src`, not in the notebook.
+- Prefer small, focused, reusable functions over monolithic code.
+- Use clear names and concise docstrings.
+- Reuse existing project structure when appropriate.
+- Do not hardcode paths, subject IDs, or analysis settings unless clearly intended; prefer config-driven or notebook-variable-driven inputs.
+
+Notebook style:
+- Treat `notebooks/posthoc_analysis.ipynb` as a continuous step-by-step analysis notebook.
+- Each section should be easy to run in sequence inside VS Code Jupyter.
+- Assume prior cells may already define variables that later cells can use.
+- Keep cells small enough that I can run one step at a time and inspect outputs before continuing.
+- Add short markdown explanations before major code blocks.
+
+When I ask for a new analysis or plot, do the following:
+1. Read the relevant repository markdown/context files first
+2. Determine what reusable functions are needed
+3. Implement or modify those functions in `src/`
+4. Append a new section to `notebooks/posthoc_analysis.ipynb`
+5. Make the notebook cells runnable in sequence using prior notebook state when appropriate
+6. Include validation prints/checks in the underlying functions
+7. At the end, summarize what files you changed, what functions you added, and what notebook section you appended
+
+Important rule:
+- Do not put substantial analysis logic only in the notebook.
+- The notebook is for orchestration, step-by-step execution, validation, and visualization.
+- Reusable logic must remain in `src/`.
 
 ## Common tasks
 

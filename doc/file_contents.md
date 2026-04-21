@@ -53,7 +53,7 @@ Each `.gdf` file contains:
 4. **target position**
    - values: 1, 2, 3, 4
 5. **distractor position**
-   - values: 1, 2, 3, 4
+   - values: 0, 2, 4
 6. **dot side**
    - 1 = right
    - 0 = left

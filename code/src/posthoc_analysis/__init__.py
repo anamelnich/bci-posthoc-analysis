@@ -1,41 +1,30 @@
-"""Python tools for CNBI attention-distraction posthoc EEG analysis."""
+"""Post-hoc analysis package for the BCI study."""
 
-from .data_io import (
-    RunPaths,
-    discover_runs,
-    read_analysis_txt,
-    read_triggers_txt,
-    read_stroop_behoutput,
-    drop_practice_trials,
+from .config import (
+    get_subject_group,
+    BCI_GROUP_SUBJECTS,
+    CONTROL_GROUP_SUBJECTS,
+    EXPECTED_SUBJECTS,
+    PROJECT_ROOT,
 )
-from .preprocessing import EpochConfig, make_epochs_from_gdf, posterior_and_lateralized_features, read_gdf_array
-from .modeling import (
-    DecoderModel,
-    train_side_decoder,
-    predict_decoder,
-    classify_three_way,
-    cross_validated_side_decoding,
+from .triggers import (
+    load_training_trigger_file,
+    compute_training_reaction_times,
+    rt_outlier_summary,
 )
-from .stats import permutation_test_multiclass_accuracy, reaction_time_from_triggers
-from .pipeline import run_project_pipeline
+from .analysis import load_training_analysis_file
+from .consolidated import generate_consolidated_training_csv, validate_all_files_comprehensive
 
 __all__ = [
-    "RunPaths",
-    "discover_runs",
-    "read_analysis_txt",
-    "read_triggers_txt",
-    "read_stroop_behoutput",
-    "drop_practice_trials",
-    "EpochConfig",
-    "make_epochs_from_gdf",
-    "posterior_and_lateralized_features",
-    "read_gdf_array",
-    "DecoderModel",
-    "train_side_decoder",
-    "predict_decoder",
-    "classify_three_way",
-    "cross_validated_side_decoding",
-    "permutation_test_multiclass_accuracy",
-    "reaction_time_from_triggers",
-    "run_project_pipeline",
+    "get_subject_group",
+    "BCI_GROUP_SUBJECTS",
+    "CONTROL_GROUP_SUBJECTS",
+    "EXPECTED_SUBJECTS",
+    "PROJECT_ROOT",
+    "load_training_trigger_file",
+    "compute_training_reaction_times",
+    "rt_outlier_summary",
+    "load_training_analysis_file",
+    "generate_consolidated_training_csv",
+    "validate_all_files_comprehensive",
 ]
