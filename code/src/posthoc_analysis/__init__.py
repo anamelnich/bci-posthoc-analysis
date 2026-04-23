@@ -13,7 +13,12 @@ from .triggers import (
     rt_outlier_summary,
 )
 from .analysis import load_training_analysis_file
-from .consolidated import generate_consolidated_training_csv, validate_all_files_comprehensive
+from .behavioral import (
+    create_behavioral_summary_table,
+    validate_behavioral_summary,
+    print_behavioral_summary_checks,
+    load_and_summarize_behavioral_data,
+)
 
 __all__ = [
     "get_subject_group",
@@ -27,4 +32,8 @@ __all__ = [
     "load_training_analysis_file",
     "generate_consolidated_training_csv",
     "validate_all_files_comprehensive",
+    "create_behavioral_summary_table",
+    "validate_behavioral_summary",
+    "print_behavioral_summary_checks",
+    "load_and_summarize_behavioral_data",
 ]

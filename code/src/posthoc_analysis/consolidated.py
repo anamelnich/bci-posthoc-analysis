@@ -636,8 +636,7 @@ def load_and_merge_training_run(run_info):
     
     # Add run-level metadata
     merged['subject_id'] = run_info['subject_id']
-    merged['session_id'] = run_info['session_id']
-    merged['session_number'] = run_info['session_number']
+    merged['session_id'] = run_info['session_number']  # Session number as integer (1 or 5)
     merged['run_id'] = run_info['run_number']  # Use sequential run number (1-8 for session 1, 1-4 for session 5)
     merged['task_type'] = run_info['task_type']
     
@@ -646,6 +645,11 @@ def load_and_merge_training_run(run_info):
 
 def generate_consolidated_training_csv(output_path=None, root_path=None):
     """Generate consolidated CSV with all training (non-practice) trial-wise data.
+    
+    The output DataFrame includes:
+    - 'group' column: 'experimental' or 'control' group membership
+    - 'session_id' column: session number as integer (1 or 5)
+    - 'run_id' column: sequential run number within session (1-8 for session 1, 1-4 for session 5)
     
     Parameters
     ----------
@@ -762,6 +766,11 @@ def generate_consolidated_training_csv(output_path=None, root_path=None):
     # Concatenate all data
     if all_data:
         consolidated = pd.concat(all_data, ignore_index=True)
+        
+        # Add group column
+        consolidated['group'] = consolidated['subject_id'].apply(
+            lambda x: 'experimental' if x in BCI_GROUP_SUBJECTS else 'control'
+        )
     else:
         consolidated = pd.DataFrame()
     
@@ -814,7 +823,7 @@ def generate_consolidated_training_csv(output_path=None, root_path=None):
     # Save to CSV
     if len(consolidated) > 0:
         # Reorder columns for readability
-        id_cols = ['subject_id', 'session_id', 'session_number', 'run_id', 'task_type', 'trial']
+        id_cols = ['subject_id', 'group', 'session_id', 'run_id', 'task_type', 'trial']
         other_cols = [c for c in consolidated.columns if c not in id_cols]
         consolidated = consolidated[id_cols + other_cols]
         
