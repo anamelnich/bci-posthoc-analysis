@@ -213,6 +213,320 @@ def generate_expected_runs_summary(subjects_found):
     }
 
 
+def collect_all_stroop_runs(root_path=None):
+    """Collect all Stroop behavioral runs (excluding practice and stroop_training).
+
+    Parameters
+    ----------
+    root_path : str or Path, optional
+        Root project path. Defaults to PROJECT_ROOT from config.
+
+    Returns
+    -------
+    tuple
+        (runs, issues, subjects_found) where:
+        - runs: list of dicts with Stroop run metadata
+        - issues: dict of missing-file and run-count issues
+        - subjects_found: list of subject IDs that have directories in the filesystem
+    """
+    if root_path is None:
+        root_path = PROJECT_ROOT
+
+    root_path = Path(root_path)
+
+    all_subjects = sorted(set(BCI_GROUP_SUBJECTS + CONTROL_GROUP_SUBJECTS))
+    subjects_found = []
+    for subject_id in all_subjects:
+        subject_folder = root_path / subject_id
+        if subject_folder.exists():
+            subjects_found.append(subject_id)
+
+    runs = []
+    issues = {
+        'missing_behoutput_files': [],
+        'unexpected_session_run_counts': [],
+    }
+
+    for subject_id in subjects_found:
+        subject_folder = root_path / subject_id
+        session_folders = sorted([
+            f for f in subject_folder.iterdir()
+            if f.is_dir() and '_' in f.name
+        ])
+
+        for session_index, session_folder in enumerate(session_folders):
+            session_info = parse_session_folder_name(session_folder.name)
+            if session_info is None:
+                continue
+
+            session_number = get_session_number(session_index)
+            session_date = session_info['session_date']
+            session_id = f"{subject_id}_{session_date}"
+
+            # Only Sessions 1 and 5 contain Stroop runs in the documented structure.
+            expected_runs = 2 if session_number in {1, 5} else 0
+
+            stroop_run_folders = sorted([
+                f for f in session_folder.iterdir()
+                if (
+                    f.is_dir()
+                    and f.name.lower().endswith('_stroop')
+                    and 'stroop_practice' not in f.name.lower()
+                    and 'stroop_training' not in f.name.lower()
+                )
+            ])
+
+            if len(stroop_run_folders) != expected_runs:
+                issues['unexpected_session_run_counts'].append({
+                    'subject_id': subject_id,
+                    'session_number': session_number,
+                    'expected_runs': expected_runs,
+                    'found_runs': len(stroop_run_folders),
+                    'run_folders': [f.name for f in stroop_run_folders],
+                })
+
+            for run_index, run_folder in enumerate(stroop_run_folders, 1):
+                run_info = parse_run_folder_name(run_folder.name)
+                if run_info is None:
+                    continue
+
+                run_id = run_folder.name
+                behoutput_file = run_folder / f"{run_id}.behoutput.txt"
+
+                if not behoutput_file.exists():
+                    issues['missing_behoutput_files'].append(str(behoutput_file))
+                    continue
+
+                runs.append({
+                    'subject_id': subject_id,
+                    'session_id': session_id,
+                    'session_number': session_number,
+                    'run_id': run_id,
+                    'run_number': run_index,
+                    'task_type': run_info['task_type'],
+                    'run_folder': run_folder,
+                    'behoutput_file': behoutput_file,
+                })
+
+    return runs, issues, subjects_found
+
+
+def generate_expected_stroop_runs_summary(subjects_found):
+    """Generate documented expected Stroop runs for the subjects present on disk."""
+    expected_runs = []
+
+    for subject_id in subjects_found:
+        for session_num in [1, 5]:
+            for run_num in [1, 2]:
+                expected_runs.append({
+                    'subject_id': subject_id,
+                    'session_number': session_num,
+                    'run_number': run_num,
+                    'expected_key': f"{subject_id}_session{session_num}_run{run_num}",
+                })
+
+    return {
+        'total_expected': len(expected_runs),
+        'expected_runs': expected_runs,
+        'runs_per_subject': 4,
+        'subjects_count': len(subjects_found),
+    }
+
+
+def compare_found_vs_expected_stroop(found_runs, expected_summary):
+    """Compare found Stroop runs against documented expectations."""
+    found_lookup = {}
+    for run in found_runs:
+        key = f"{run['subject_id']}_session{run['session_number']}"
+        found_lookup.setdefault(key, []).append(run)
+
+    missing_runs = []
+    found_by_subject_session = {}
+
+    for subject_id in sorted({item['subject_id'] for item in expected_summary['expected_runs']}):
+        for session_num in [1, 5]:
+            key = f"{subject_id}_session{session_num}"
+            found_count = len(found_lookup.get(key, []))
+            expected_count = 2
+
+            if found_count < expected_count:
+                missing_runs.append({
+                    'subject_id': subject_id,
+                    'session_number': session_num,
+                    'expected_runs': expected_count,
+                    'found_runs': found_count,
+                    'missing_count': expected_count - found_count,
+                })
+
+            found_by_subject_session[key] = found_count
+
+    return {
+        'missing_runs': missing_runs,
+        'found_by_subject_session': found_by_subject_session,
+        'total_found': len(found_runs),
+        'total_expected': expected_summary['total_expected'],
+    }
+
+
+STROOP_BEHOUTPUT_COLUMNS = [
+    'trial_number',
+    'trial_type',
+    'stimulus',
+    'ink_color',
+    'response',
+    'reaction_time_ms',
+]
+
+
+def load_stroop_behoutput_file(filepath):
+    """Load and validate a Stroop behavioral output file."""
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"Stroop behavioral file not found: {filepath}")
+
+    df = pd.read_csv(
+        filepath,
+        sep="\t",
+        dtype={
+            'Trial': int,
+            'Trial_Type': str,
+            'Stimulus': str,
+            'Ink_Color': str,
+            'Response': int,
+        },
+        na_values=['NA'],
+        keep_default_na=True,
+    )
+    df = df.rename(columns={
+        'Trial': 'trial_number',
+        'Trial_Type': 'trial_type',
+        'Stimulus': 'stimulus',
+        'Ink_Color': 'ink_color',
+        'Response': 'response',
+        'Reaction_Time': 'reaction_time_ms',
+    })
+
+    validate_stroop_behoutput(df, filepath)
+    return df
+
+
+def validate_stroop_behoutput(df, filepath=None):
+    """Validate that a Stroop behavioral file matches documented structure."""
+    location = f" {filepath}" if filepath else ""
+
+    if list(df.columns) != STROOP_BEHOUTPUT_COLUMNS:
+        raise ValueError(
+            f"Unexpected columns in Stroop behavioral file{location}. "
+            f"Expected {STROOP_BEHOUTPUT_COLUMNS}, got {list(df.columns)}."
+        )
+
+    if df.shape[0] != 60:
+        raise ValueError(
+            f"Expected 60 rows in Stroop behavioral file{location}, got {df.shape[0]} rows."
+        )
+
+    expected_trials = list(range(1, 61))
+    actual_trials = df['trial_number'].tolist()
+    if actual_trials != expected_trials:
+        raise ValueError(
+            f"Trial numbers must be consecutive 1..60 in Stroop behavioral file{location}. "
+            f"Found: {actual_trials[:5]}...{actual_trials[-5:]}"
+        )
+
+    valid_trial_types = {'congruent', 'incongruent'}
+    observed_trial_types = set(df['trial_type'].astype(str).str.lower().str.strip())
+    invalid_trial_types = sorted(observed_trial_types - valid_trial_types)
+    if invalid_trial_types:
+        raise ValueError(
+            f"Invalid Stroop trial types in{location}: {invalid_trial_types}. "
+            f"Expected only {sorted(valid_trial_types)}."
+        )
+
+    valid_colors = {'blue', 'green', 'yellow', 'red'}
+    for column in ['stimulus', 'ink_color']:
+        observed_values = set(df[column].astype(str).str.lower().str.strip())
+        invalid_values = sorted(observed_values - valid_colors)
+        if invalid_values:
+            raise ValueError(
+                f"Invalid values in column '{column}' for Stroop behavioral file{location}: "
+                f"{invalid_values}. Expected only {sorted(valid_colors)}."
+            )
+
+    valid_responses = {1, 2, 3}
+    invalid_responses = sorted(set(df.loc[~df['response'].isin(valid_responses), 'response']))
+    if invalid_responses:
+        raise ValueError(
+            f"Invalid response values in Stroop behavioral file{location}: "
+            f"{invalid_responses}. Expected only {sorted(valid_responses)}."
+        )
+
+    if (df.loc[df['response'].isin([1, 2]), 'reaction_time_ms'].isna()).any():
+        raise ValueError(
+            f"Correct/incorrect Stroop trials must have reaction times in file{location}."
+        )
+
+    if (df.loc[df['response'] == 3, 'reaction_time_ms'].notna()).any():
+        raise ValueError(
+            f"Timeout Stroop trials should have missing reaction times in file{location}."
+        )
+
+    if (df.loc[df['response'].isin([1, 2]), 'reaction_time_ms'] <= 0).any():
+        raise ValueError(
+            f"Non-timeout Stroop trials must have positive reaction times in file{location}."
+        )
+
+
+def validate_all_stroop_files(root_path=None):
+    """Comprehensively validate all Stroop behavioral files against documentation."""
+    if root_path is None:
+        root_path = PROJECT_ROOT
+
+    validation_results = {
+        'total_files_checked': 0,
+        'issues': {
+            'behoutput_files': [],
+            'file_count_mismatches': [],
+        },
+        'summary': {
+            'behoutput_files_valid': 0,
+        },
+    }
+
+    all_runs, collection_issues, _ = collect_all_stroop_runs(root_path)
+    validation_results['issues']['file_count_mismatches'].extend(
+        collection_issues['unexpected_session_run_counts']
+    )
+    for missing_file in collection_issues['missing_behoutput_files']:
+        validation_results['issues']['behoutput_files'].append({
+            'file': missing_file,
+            'issue': 'File does not exist',
+        })
+
+    for run_info in all_runs:
+        validation_results['total_files_checked'] += 1
+        try:
+            load_stroop_behoutput_file(run_info['behoutput_file'])
+            validation_results['summary']['behoutput_files_valid'] += 1
+        except Exception as exc:
+            validation_results['issues']['behoutput_files'].append({
+                'file': str(run_info['behoutput_file']),
+                'issue': str(exc),
+            })
+
+    return validation_results
+
+
+def load_and_merge_stroop_run(run_info):
+    """Load a single Stroop behavioral file and add run-level metadata."""
+    behoutput_df = load_stroop_behoutput_file(run_info['behoutput_file']).copy()
+
+    behoutput_df['subject_id'] = run_info['subject_id']
+    behoutput_df['session_id'] = run_info['session_number']
+    behoutput_df['run_id'] = run_info['run_number']
+
+    return behoutput_df
+
+
 def validate_all_training_files(root_path=None):
     """Comprehensive validation of all training trigger and analysis files against documentation.
     
@@ -846,6 +1160,191 @@ def generate_consolidated_training_csv(output_path=None, root_path=None):
     }
 
 
+def generate_consolidated_stroop_csv(output_path=None, root_path=None):
+    """Generate a consolidated CSV with all non-practice Stroop behavioral trials.
+
+    The output DataFrame includes:
+    - 'group' column: 'experimental' or 'control'
+    - 'session_id' column: session number as integer (1 or 5)
+    - 'run_id' column: sequential Stroop run number within session (1 or 2)
+    - all trial-wise columns from the Stroop `.behoutput.txt` files
+    """
+    if output_path is None:
+        output_path = Path(
+            '/Users/hililbby/Library/CloudStorage/Box-Box/CNBI/Attention_distraction'
+            '/project_healthy/analyses/all_subjects_stroop.csv'
+        )
+    else:
+        output_path = Path(output_path)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    all_runs, collection_issues, subjects_found = collect_all_stroop_runs(root_path)
+    expected_summary = generate_expected_stroop_runs_summary(subjects_found)
+    comparison = compare_found_vs_expected_stroop(all_runs, expected_summary)
+
+    print(
+        "Expected Stroop runs based on experiment structure: "
+        f"{expected_summary['total_expected']} "
+        f"(4 per subject × {len(subjects_found)} subjects found)"
+    )
+    print(f"Found complete Stroop run(s) with behavioral files: {len(all_runs)}")
+
+    if len(subjects_found) != len(set(BCI_GROUP_SUBJECTS + CONTROL_GROUP_SUBJECTS)):
+        print(
+            "WARNING: Consolidated Stroop CSV contains "
+            f"{len(subjects_found)} subjects rather than the full "
+            f"{len(set(BCI_GROUP_SUBJECTS + CONTROL_GROUP_SUBJECTS))}-subject study roster. "
+            "Proceeding with available data."
+        )
+
+    if len(all_runs) != expected_summary['total_expected']:
+        difference = len(all_runs) - expected_summary['total_expected']
+        print(
+            f"WARNING: Found {len(all_runs)} Stroop runs but expected "
+            f"{expected_summary['total_expected']} based on experiment structure."
+        )
+        if difference < 0:
+            print(
+                "This suggests missing Stroop data for "
+                f"{abs(difference)} runs."
+            )
+        else:
+            print(
+                "This suggests "
+                f"{difference} extra Stroop run(s) or mislabeled run folders beyond the "
+                "documented experiment structure."
+            )
+        print("\n" + "=" * 80)
+        print("DETAILED MISSING STROOP RUNS ANALYSIS")
+        print("=" * 80)
+        if comparison['missing_runs']:
+            for missing in comparison['missing_runs']:
+                print(
+                    f"  - Subject {missing['subject_id']}, Session {missing['session_number']}: "
+                    f"Expected {missing['expected_runs']} runs, found {missing['found_runs']} "
+                    f"(missing {missing['missing_count']} runs)"
+                )
+        else:
+            print("No missing session-specific Stroop runs were identified.")
+
+        print("\nRuns found by subject/session:")
+        for key, count in sorted(comparison['found_by_subject_session'].items()):
+            print(f"  {key}: {count}/2 runs")
+        print("=" * 80)
+        print()
+    else:
+        print("✓ Found expected number of Stroop runs.")
+        print()
+
+    all_data = []
+    merge_issues = {
+        'load_errors': [],
+    }
+
+    for run_info in all_runs:
+        try:
+            merged = load_and_merge_stroop_run(run_info)
+            all_data.append(merged)
+        except Exception as exc:
+            error_msg = f"{run_info['run_id']}: {exc}"
+            merge_issues['load_errors'].append(error_msg)
+            print(f"ERROR loading {run_info['run_id']}: {exc}")
+
+    if all_data:
+        consolidated = pd.concat(all_data, ignore_index=True)
+        consolidated['group'] = consolidated['subject_id'].apply(
+            lambda x: 'experimental' if x in BCI_GROUP_SUBJECTS else 'control'
+        )
+    else:
+        consolidated = pd.DataFrame()
+
+    has_issues = (
+        collection_issues['missing_behoutput_files']
+        or collection_issues['unexpected_session_run_counts']
+        or merge_issues['load_errors']
+    )
+
+    if has_issues:
+        print("=" * 70)
+        print("ISSUES FOUND DURING STROOP CONSOLIDATION")
+        print("=" * 70)
+        print(f"Total runs successfully loaded: {len(all_data)}")
+        print(f"Total trials: {len(consolidated)}")
+        print(
+            f"Unique subjects: "
+            f"{consolidated['subject_id'].nunique() if len(consolidated) > 0 else 0}"
+        )
+        print(
+            f"Unique sessions: "
+            f"{consolidated['session_id'].nunique() if len(consolidated) > 0 else 0}"
+        )
+        print()
+
+        if collection_issues['unexpected_session_run_counts']:
+            print(
+                "Session run-count mismatches: "
+                f"{len(collection_issues['unexpected_session_run_counts'])}"
+            )
+            for issue in collection_issues['unexpected_session_run_counts'][:10]:
+                print(
+                    f"  - Subject {issue['subject_id']}, Session {issue['session_number']}: "
+                    f"expected {issue['expected_runs']} Stroop runs, found {issue['found_runs']}"
+                )
+            if len(collection_issues['unexpected_session_run_counts']) > 10:
+                print(
+                    f"  ... and "
+                    f"{len(collection_issues['unexpected_session_run_counts']) - 10} more"
+                )
+            print()
+
+        if collection_issues['missing_behoutput_files']:
+            print(f"Missing behavioral files: {len(collection_issues['missing_behoutput_files'])}")
+            for filepath in collection_issues['missing_behoutput_files'][:10]:
+                print(f"  - {filepath}")
+            if len(collection_issues['missing_behoutput_files']) > 10:
+                print(
+                    f"  ... and {len(collection_issues['missing_behoutput_files']) - 10} more"
+                )
+            print()
+
+        if merge_issues['load_errors']:
+            print(f"Load errors: {len(merge_issues['load_errors'])}")
+            for error_msg in merge_issues['load_errors'][:10]:
+                print(f"  - {error_msg}")
+            if len(merge_issues['load_errors']) > 10:
+                print(f"  ... and {len(merge_issues['load_errors']) - 10} more")
+            print()
+
+        print("=" * 70)
+        print()
+
+    if len(consolidated) > 0:
+        id_cols = ['subject_id', 'group', 'session_id', 'run_id', 'trial_number']
+        other_cols = [c for c in consolidated.columns if c not in id_cols]
+        consolidated = consolidated[id_cols + other_cols]
+        consolidated.to_csv(output_path, index=False)
+        print(f"Saved consolidated Stroop data to: {output_path}")
+    else:
+        print("No Stroop data to save (all runs failed to load).")
+
+    print("=" * 70)
+    print()
+
+    return {
+        'dataframe': consolidated,
+        'output_path': str(output_path),
+        'total_runs': len(all_data),
+        'total_trials': len(consolidated),
+        'subjects_present': (
+            sorted(consolidated['subject_id'].unique().tolist())
+            if len(consolidated) > 0 else []
+        ),
+        'collection_issues': collection_issues,
+        'merge_issues': merge_issues,
+    }
+
+
 def validate_all_files_comprehensive():
     """Run comprehensive validation of all training files and report results.
     
@@ -915,3 +1414,45 @@ def validate_all_files_comprehensive():
         
         print("=" * 80)
         return False
+
+
+def validate_all_stroop_files_comprehensive():
+    """Run comprehensive validation of all Stroop behavioral files and report results."""
+    print("Running comprehensive validation of all Stroop behavioral files...")
+    print("=" * 80)
+
+    results = validate_all_stroop_files()
+
+    print(f"Files checked: {results['total_files_checked']}")
+    print(f"Valid behavioral files: {results['summary']['behoutput_files_valid']}")
+    print()
+
+    total_issues = sum(len(issues) for issues in results['issues'].values())
+
+    if total_issues == 0:
+        print("✓ All Stroop behavioral files look good. No issues found.")
+        return True
+
+    print(f"✗ Found {total_issues} Stroop-file issues:")
+    print()
+
+    if results['issues']['file_count_mismatches']:
+        print(f"Session run-count mismatches: {len(results['issues']['file_count_mismatches'])}")
+        for issue in results['issues']['file_count_mismatches']:
+            print(
+                f"  - Subject {issue['subject_id']}, Session {issue['session_number']}: "
+                f"expected {issue['expected_runs']} runs, found {issue['found_runs']}"
+            )
+        print()
+
+    if results['issues']['behoutput_files']:
+        print(f"Behavioral file issues: {len(results['issues']['behoutput_files'])}")
+        for issue in results['issues']['behoutput_files'][:20]:
+            print(f"  - {issue['file']}: {issue['issue']}")
+        if len(results['issues']['behoutput_files']) > 20:
+            print(
+                f"  ... and {len(results['issues']['behoutput_files']) - 20} more"
+            )
+        print()
+
+    return False
