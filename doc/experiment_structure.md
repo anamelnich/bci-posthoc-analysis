@@ -105,3 +105,30 @@ Each of these sessions includes:
 - Each **run is independent** and consists of a fixed number of trials.
 - Practice runs should be excluded by default from all analyses.
 - Sessions 2–4 focus exclusively on **decoding**, while Sessions 1 and 5 include a broader set of tasks (training, Stroop, calibration).
+
+## Subject-Specific Exceptions
+
+- `e30` Session 1 has only **7 non-practice training runs** instead of the
+  expected 8.
+  - For session-level EEG condition averages, report the mismatch and average
+    across the 7 available run-level averages.
+  - Keep `n_runs` and `expected_n_runs` in output manifests so the incomplete
+    session is explicit in downstream analyses.
+- `e27` Session 1 completed only **5 decoding runs total, including practice**.
+  - For BCI online-posterior consolidation, retain all 5 runs and treat them as experimental runs.
+  - Do not remove a practice run from `e27` Session 1 online posterior data.
+  - Align threshold-log rows to these 5 retained runs before writing trial-level BCI CSVs.
+- `e42` Session 2 has malformed online-info tail records.
+  - The online posterior file has 544 rows: 9 complete 60-trial runs plus 4 extra trailing rows.
+  - Drop the final 4 online-posterior rows, then remove the leading practice run normally.
+  - The threshold log has 10 rows for Session 2 instead of the expected 9 rows.
+  - Drop the 10th threshold-log row for Session 2, then remove the leading practice/log row normally.
+- `e43` Session 5 has malformed online-info tail records.
+  - The online posterior file has 422 rows: 7 complete 60-trial runs plus 2 extra trailing rows.
+  - Drop the final 2 online-posterior rows, then remove the leading practice run normally.
+  - The threshold log has 8 rows for Session 5 instead of the expected 7 rows.
+  - Drop the 8th threshold-log row for Session 5, then remove the leading practice/log row normally.
+- `e46` Session 4 has a shortened decoding practice run in the online posterior file.
+  - The practice run has only 32 trials, so the online posterior file has 512 rows.
+  - Drop only the first 32 online-posterior rows, then treat the remaining 480 rows as the 8 experimental runs.
+  - This exception does not change threshold-log handling; remove the leading Session 4 threshold-log practice row normally.

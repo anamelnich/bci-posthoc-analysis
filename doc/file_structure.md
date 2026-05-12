@@ -9,6 +9,7 @@ Use this file when:
 Do NOT use this file for:
 - interpreting file contents (see file_contents.md)
 - understanding trigger meanings (see triggers.md)
+- understanding generated analysis CSV fields (see analysis_outputs.md)
 
 ---
 
@@ -102,7 +103,31 @@ project_healthy/online_info
 Contains:
 
 - threshold logs (`*_thrlog.mat`)
+  - 1 per subject
 - online posterior files (`*_OnlinePosteriors_*.mat`)
+  - 5 per subject (for each session)
+  - subject-level exceptions are documented in `experiment_structure.md` and
+    file-specific row-count exceptions are documented in `file_contents.md`
+  - `e42` Session 2 has extra tail rows in online-info files; see
+    `experiment_structure.md` before consolidating BCI trial-level data
+  - `e43` Session 5 has extra tail rows in online-info files; see
+    `experiment_structure.md` before consolidating BCI trial-level data
+  - `e46` Session 4 has a shortened practice block in the online posterior file;
+    see `experiment_structure.md` before consolidating BCI trial-level data
+
+## Analysis Outputs Folder
+
+Located at:
+
+project_healthy/analyses
+
+Contains generated CSV files used for downstream analyses and plotting:
+
+- `all_subjects_training.csv`
+- `all_subjects_stroop.csv`
+- `all_subjects_bci.csv`
+
+For row grain, column definitions, and field meanings, see `analysis_outputs.md`.
 
 ## Session-Level Extra Files
 

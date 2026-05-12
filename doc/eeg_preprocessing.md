@@ -66,13 +66,16 @@ This value is stored in decoder files as `fsamp`.
 
 ## 2. Temporal Filtering
 
-The pipeline bandpass filters the EEG from:
+The pipeline applies a zero-phase bandpass filter to the analysis EEG channels
+from:
 
 - **0.1 to 20 Hz**
 
 This filter definition is stored in decoder files in `spectralFilter`.
 
-This is the temporal filter that should be used when reproducing the decoder preprocessing pipeline.
+Use zero-phase filtering for offline post hoc preprocessing so phase timing of
+ERP components is not shifted. This is the temporal filter that should be used
+when reproducing the decoder preprocessing pipeline.
 
 ---
 
@@ -81,6 +84,16 @@ This is the temporal filter that should be used when reproducing the decoder pre
 Data are epoched relative to stimulus onset using a window of approximately:
 
 - **-0.5 s to +1.0 s**
+
+For training and decoding runs, stimulus onset means the second trigger in each
+trial:
+
+- `8` = no distractor stimulus
+- `32` = right distractor stimulus
+- `44` = left distractor stimulus
+
+Do not use fixation trigger `4` as the default EEG epoching anchor. Fixation can
+be used only for analyses that explicitly target fixation-locked activity.
 
 Decoder files store:
 - `epochOnset` = sample index corresponding to time 0
@@ -92,6 +105,11 @@ Decoder files store:
 Baseline correction is applied using the pre-stimulus interval:
 
 - **-0.2 to 0 s**
+- For the default -0.5 to +1.0 s epoch at 512 Hz, this corresponds to epoch
+  sample indices **154:256** using Python stop-exclusive indexing.
+- Compute the mean over the baseline samples separately for each
+  channel × trial, then subtract that mean from every timepoint in the matching
+  channel × trial epoch.
 
 Decoder files store:
 - `baseline_iscompute`
@@ -105,6 +123,21 @@ Decoder files store:
 ---
 
 ## 5. Channel Selection / ROI
+
+Before any EEG plotting, epoching, ERP computation, topoplotting, or decoder-style
+feature extraction, remove channels that are present in the raw `.gdf` files but
+are not scalp EEG analysis channels:
+
+- `M1`
+- `M2`
+- `EOG`
+- `sens7`
+- `sens8`
+
+`M1` and `M2` are mastoid/reference channels. `EOG`, `sens7`, and `sens8` are
+eye/sensor channels. These channels may be useful for artifact inspection, but
+they should not be included in Pd/ERP plotting, topoplots, or downstream EEG
+feature analyses unless an analysis explicitly targets artifact/EOG signals.
 
 The decoder focuses on posterior homologous channels in the:
 
@@ -141,6 +174,44 @@ For each homologous pair:
 - **right-distractor trials**: compute (left − right)
 
 The resulting difference signals are then passed into the xDAWN spatial filtering step.
+
+### Pd PO7/PO8 difference wave
+
+For post hoc Pd plotting and measurement, compute the Pd as a PO7/PO8
+difference wave on baseline-corrected stimulus-locked epochs. Ignore
+no-distractor trials (`8`) for Pd averaging.
+
+For each distractor trial:
+- right distractor (`32`): `PO7 - PO8`
+- left distractor (`44`): `PO8 - PO7`
+
+The resulting single-trial Pd waveforms have shape `samples x distractor_trials`.
+The grand-average Pd is the average across distractor trials.
+
+For group-level pre/post Pd figures built from
+`training_session_condition_eeg_averages.csv`, compute subject/session Pd from
+the saved condition-average matrices before group averaging:
+
+- `distractor_right`: `PO7 - PO8`
+- `distractor_left`: `PO8 - PO7`
+- `no_distractor`: validate presence but ignore for Pd
+
+Because training runs have balanced left and right distractor counts, the
+subject/session Pd waveform is the equal average of the left- and
+right-distractor Pd waveforms. Group figures then average these subject-level
+waveforms and plot SEM across subjects. The default pre/post plot window is
+`-0.2` to `0.7` s, with the decoder construction window `0.2` to `0.5` s
+shaded. Group Pd plots use a fixed y-axis range from `-1.5` to `1.5`
+microvolts and a square figure layout by default.
+
+### Pd positive area under the curve
+
+For subject-level Pd summary statistics, compute positive area under the curve
+within the decoder construction window (`0.2` to `0.5` s). Positive AUC is the
+trapezoidal integral of `max(Pd, 0)` over time, producing units of
+microvolts × seconds. Compute this separately for each subject and session from
+the subject/session Pd waveform, then use those values for Group × Session
+statistics.
 
 ---
 

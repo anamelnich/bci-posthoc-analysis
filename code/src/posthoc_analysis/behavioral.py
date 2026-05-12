@@ -3752,6 +3752,138 @@ def _plot_rt_combined_barplot(cleaned_trial_data):
     return fig
 
 
+def summarize_distractor_trial_reaction_time_from_training_csv(
+    csv_path=None,
+    save_figure=True,
+):
+    """Compute and plot distractor-trial RT means from consolidated training CSV.
+
+    Uses the same RT inclusion rules as the primary training RT analysis:
+    correct trials only, RT >= 150 ms, and subject/session mean +/- 3 SD
+    outlier removal before subject-level averaging.
+    """
+    if csv_path is None:
+        csv_path = PROJECT_ROOT / "analyses" / "all_subjects_training.csv"
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Consolidated training CSV not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+    print("DISTRACTOR-TRIAL TRAINING RT SUMMARY")
+    print(f"  Source CSV: {csv_path}")
+    print(f"  Raw rows x columns: {df.shape}")
+
+    trial_data, warnings_list, _ = _prepare_reaction_time_trial_data(df)
+    trial_data_clean, outlier_report = _remove_rt_outliers(trial_data)
+    subject_session_summary = _aggregate_subject_reaction_times(trial_data_clean)
+    distractor_subject = subject_session_summary[
+        subject_session_summary["trial_type"] == "distractor"
+    ].copy()
+
+    if distractor_subject.empty:
+        raise ValueError("No distractor-trial subject/session RT rows were computed.")
+
+    expected_cells = (
+        distractor_subject.groupby(["group", "session"], observed=False)["subject_id"]
+        .nunique()
+        .reset_index(name="n_subjects")
+    )
+    print("\nDistractor RT subject counts:")
+    print(expected_cells.to_string(index=False))
+
+    cell_summary = (
+        distractor_subject
+        .groupby(["group", "session"], observed=False)["mean_rt_ms"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+        .rename(columns={
+            "mean": "mean_rt_ms",
+            "std": "sd_rt_ms",
+            "count": "n_subjects",
+        })
+    )
+    cell_summary["sem_rt_ms"] = cell_summary["sd_rt_ms"] / np.sqrt(cell_summary["n_subjects"])
+    cell_summary["session_id"] = cell_summary["session"].map({"pre": 1, "post": 5})
+    cell_summary["group_label"] = cell_summary["group"].map({
+        "experimental": "BCI",
+        "control": "Mental rehearsal",
+    })
+    cell_summary = cell_summary.sort_values(["group", "session_id"]).reset_index(drop=True)
+
+    print("\nDistractor-trial RT group/session means:")
+    print(cell_summary.to_string(index=False))
+
+    with plt.rc_context(_publication_style_rcparams()):
+        fig = _plot_distractor_rt_session_group_summary(cell_summary)
+
+    output_path = None
+    if save_figure:
+        output_path = _save_figure_pdf(fig, "behavioral_rt_distractor_session1_session5")
+
+    return {
+        "source_csv": csv_path,
+        "trial_data_clean": trial_data_clean,
+        "outlier_report": outlier_report,
+        "subject_session_distractor_rt": distractor_subject,
+        "cell_summary": cell_summary,
+        "figure": fig,
+        "figure_path": output_path,
+        "warnings": warnings_list,
+    }
+
+
+def _plot_distractor_rt_session_group_summary(cell_summary):
+    """Plot average distractor-trial RT by group and session."""
+    colors = {"control": "#4C72B0", "experimental": "#DD8452"}
+    session_positions = {"pre": 0.0, "post": 1.0}
+    group_offsets = {"control": -0.16, "experimental": 0.16}
+    group_labels = {"control": "Control", "experimental": "BCI"}
+
+    fig, ax = plt.subplots(figsize=(4.2, 4.2))
+    plotted_values = []
+
+    for group in ["control", "experimental"]:
+        group_df = cell_summary[cell_summary["group"] == group].copy()
+        group_df["x"] = group_df["session"].map(session_positions)
+        group_df = group_df.sort_values("x")
+        if group_df.empty:
+            continue
+
+        x = group_df["x"].to_numpy() + group_offsets[group]
+        y = group_df["mean_rt_ms"].to_numpy()
+        sem = group_df["sem_rt_ms"].to_numpy()
+        plotted_values.extend((y - sem).tolist())
+        plotted_values.extend((y + sem).tolist())
+
+        ax.errorbar(
+            x,
+            y,
+            yerr=sem,
+            marker="o",
+            markersize=4,
+            color=colors[group],
+            capsize=3,
+            capthick=0.8,
+            linewidth=1.2,
+            label=group_labels[group],
+        )
+
+    ax.set_xticks([session_positions["pre"], session_positions["post"]])
+    ax.set_xticklabels(["Session 1", "Session 5"])
+    ax.set_xlim(-0.45, 1.45)
+    ax.set_ylabel("Distractor-trial RT (ms)")
+    ax.set_title("Distractor-Trial Reaction Time")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["bottom"].set_linewidth(0.8)
+    ax.spines["left"].set_linewidth(0.8)
+    ax.tick_params(axis="both", which="both", length=3, width=0.8)
+    _set_y_limits_with_padding(ax, plotted_values, pad_fraction=0.12, min_pad=20.0)
+    ax.legend(loc="best", handlelength=1.8)
+    fig.tight_layout()
+    return fig
+
+
 def _set_y_limits_with_padding(ax, values, pad_fraction=0.08, min_pad=0.002):
     """Set y-limits with explicit padding at both ends of the axis."""
     finite_values = np.asarray(values, dtype=float)
@@ -3794,3 +3926,4 @@ def _save_figure_pdf(fig, filename_stem):
     output_path = FIGURES_DIR / f"{filename_stem}.pdf"
     fig.savefig(output_path, format="pdf", bbox_inches="tight")
     print(f"Saved figure: {output_path}")
+    return output_path

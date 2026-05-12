@@ -55,6 +55,16 @@ So each trial has:
 
 `[4 → (8 | 32 | 44) → 64]`
 
+### EEG epoching anchor
+
+For EEG epoching, ERP plotting, Pd measurement, and decoder-style event-locked
+feature extraction, the trial event of interest is the **stimulus presentation**
+trigger, not the fixation trigger.
+
+- Epoch to trigger `8`, `32`, or `44`
+- Do **not** epoch to fixation trigger `4` unless explicitly analyzing fixation
+- Treat time 0 as stimulus onset / condition onset
+
 ---
 
 ## 4. Determining Trial Type
@@ -145,6 +155,12 @@ Each trial has **2 triggers**:
   - 4 → (8 / 32 / 44) → 64
 
 If this pattern breaks, data may be corrupted or misaligned.
+
+For stimulus-locked EEG epoching, the required Status-channel anchors are the
+60 stimulus events (`8`, `32`, or `44`). If a response event (`64`) is missing
+but all stimulus events are present and each stimulus follows fixation (`4`),
+epoching may continue with a warning because the response event is not used as
+time 0.
 
 ---
 
