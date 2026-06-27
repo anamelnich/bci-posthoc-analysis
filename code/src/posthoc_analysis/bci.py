@@ -1342,6 +1342,773 @@ def load_and_plot_bci_auc(csv_path=None, variability="sem", save=True):
     }
 
 
+def compute_bci_subject_session_balanced_accuracy(df):
+    """Compute subject/session balanced accuracy from online BCI correctness output.
+
+    ``decoding_task`` supplies ground-truth trial type (1 = distractor,
+    0 = no distractor). ``decoding_bci_output`` is treated as the online
+    predicted class (1 = Pd/distractor class, 0 = no-Pd/no-distractor class,
+    3 = ambivalent). Ambivalent trials are excluded before computing class-wise
+    accuracies.
+    """
+    required_columns = {
+        "subject_id",
+        "group",
+        "session_id",
+        "run_id",
+        "decoding_task",
+        "decoding_bci_output",
+    }
+    missing_columns = sorted(required_columns - set(df.columns))
+    if missing_columns:
+        raise ValueError(
+            "BCI balanced accuracy analysis is missing required columns: "
+            f"{missing_columns}. Regenerate all_subjects_bci.csv with decoding "
+            "analysis columns before running this analysis."
+        )
+
+    data = df.copy()
+    print("=" * 80)
+    print("BCI BALANCED ACCURACY INPUT VALIDATION")
+    print("=" * 80)
+    print(f"Input rows: {len(data)}")
+    print(f"Subjects: {data['subject_id'].nunique()}")
+    print(f"Sessions: {sorted(data['session_id'].dropna().unique().tolist())}")
+
+    data["session_id"] = pd.to_numeric(data["session_id"], errors="raise").astype(int)
+    data["decoding_task"] = pd.to_numeric(data["decoding_task"], errors="coerce")
+    data["decoding_bci_output"] = pd.to_numeric(
+        data["decoding_bci_output"], errors="coerce"
+    )
+
+    missing_label_mask = data["decoding_task"].isna()
+    missing_output_mask = data["decoding_bci_output"].isna()
+    if missing_label_mask.any() or missing_output_mask.any():
+        missing_summary = (
+            data.loc[missing_label_mask | missing_output_mask]
+            .groupby(["subject_id", "group", "session_id", "run_id"], observed=False)
+            .agg(
+                n_missing_decoding_task=("decoding_task", lambda value: value.isna().sum()),
+                n_missing_decoding_bci_output=(
+                    "decoding_bci_output",
+                    lambda value: value.isna().sum(),
+                ),
+            )
+            .reset_index()
+            .sort_values(["group", "subject_id", "session_id", "run_id"])
+        )
+        print("\nRows excluded because decoding labels/output are missing:")
+        print(missing_summary.to_string(index=False))
+    else:
+        missing_summary = pd.DataFrame()
+
+    valid = data[
+        data["decoding_task"].notna() & data["decoding_bci_output"].notna()
+    ].copy()
+    valid["decoding_task"] = valid["decoding_task"].astype(int)
+    valid["decoding_bci_output"] = valid["decoding_bci_output"].astype(int)
+
+    invalid_tasks = sorted(set(valid["decoding_task"]) - {0, 1})
+    if invalid_tasks:
+        raise ValueError(f"decoding_task must contain only 0/1 labels. Found: {invalid_tasks}")
+    invalid_outputs = sorted(set(valid["decoding_bci_output"]) - {0, 1, 3})
+    if invalid_outputs:
+        raise ValueError(
+            "decoding_bci_output must contain only 0, 1, or 3. "
+            f"Found: {invalid_outputs}"
+        )
+
+    output_counts = (
+        valid.groupby(["group", "session_id", "decoding_bci_output"], observed=False)
+        .size()
+        .reset_index(name="n_trials")
+        .sort_values(["group", "session_id", "decoding_bci_output"])
+    )
+    print("\nBCI output counts by group/session before excluding ambivalent trials:")
+    print(output_counts.to_string(index=False))
+
+    non_ambivalent = valid[valid["decoding_bci_output"].isin([0, 1])].copy()
+    excluded_ambivalent = (
+        valid[valid["decoding_bci_output"] == 3]
+        .groupby(["subject_id", "group", "session_id"], observed=False)
+        .size()
+        .reset_index(name="n_ambivalent_trials_excluded")
+        .sort_values(["group", "subject_id", "session_id"])
+    )
+    if not excluded_ambivalent.empty:
+        print("\nAmbivalent trials excluded from balanced accuracy:")
+        print(excluded_ambivalent.to_string(index=False))
+
+    rows = []
+    skipped = []
+    for (subject_id, group, session_id), cell in non_ambivalent.groupby(
+        ["subject_id", "group", "session_id"], observed=False
+    ):
+        class_counts = cell["decoding_task"].value_counts().to_dict()
+        if 0 not in class_counts or 1 not in class_counts:
+            skipped.append({
+                "subject_id": subject_id,
+                "group": group,
+                "session_id": int(session_id),
+                "n_no_distractor": int(class_counts.get(0, 0)),
+                "n_distractor": int(class_counts.get(1, 0)),
+                "issue": "One ground-truth class absent after ambivalent exclusion.",
+            })
+            continue
+
+        distractor_trials = cell[cell["decoding_task"] == 1]
+        no_distractor_trials = cell[cell["decoding_task"] == 0]
+        tpr = float((distractor_trials["decoding_bci_output"] == 1).mean())
+        tnr = float((no_distractor_trials["decoding_bci_output"] == 0).mean())
+        rows.append({
+            "subject_id": subject_id,
+            "group": group,
+            "session_id": int(session_id),
+            "balanced_accuracy": (tpr + tnr) / 2.0,
+            "tpr_distractor_accuracy": tpr,
+            "tnr_no_distractor_accuracy": tnr,
+            "n_trials_non_ambivalent": int(len(cell)),
+            "n_distractor_non_ambivalent": int(len(distractor_trials)),
+            "n_no_distractor_non_ambivalent": int(len(no_distractor_trials)),
+            "n_runs": int(cell["run_id"].nunique()),
+        })
+
+    subject_session_balanced_accuracy = pd.DataFrame(rows)
+    skipped_df = pd.DataFrame(skipped)
+    if subject_session_balanced_accuracy.empty:
+        raise ValueError("No subject/session balanced accuracy rows could be computed.")
+
+    print("\nSubject/session balanced accuracy rows computed:")
+    print(
+        f"{len(subject_session_balanced_accuracy)} rows "
+        f"(full design has {len(EXPECTED_SUBJECTS) * EXPECTED_SESSIONS})."
+    )
+    if not skipped_df.empty:
+        print("\nBalanced accuracy skipped for subject/session cells:")
+        print(skipped_df.to_string(index=False))
+
+    print("\nBalanced accuracy range:")
+    print(
+        f"{subject_session_balanced_accuracy['balanced_accuracy'].min():.3f} - "
+        f"{subject_session_balanced_accuracy['balanced_accuracy'].max():.3f}"
+    )
+
+    return {
+        "subject_session_balanced_accuracy": subject_session_balanced_accuracy,
+        "output_counts": output_counts,
+        "excluded_ambivalent": excluded_ambivalent,
+        "missing_summary": missing_summary,
+        "skipped": skipped_df,
+    }
+
+
+def summarize_bci_balanced_accuracy_by_group(subject_session_balanced_accuracy, variability="sem"):
+    """Summarize subject/session balanced accuracy by group and session."""
+    if variability not in {"sem", "sd"}:
+        raise ValueError("variability must be 'sem' or 'sd'.")
+    if subject_session_balanced_accuracy.empty:
+        raise ValueError("No balanced accuracy rows are available to summarize.")
+
+    summary = (
+        subject_session_balanced_accuracy
+        .groupby(["group", "session_id"], observed=False)["balanced_accuracy"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+        .rename(
+            columns={
+                "mean": "mean_balanced_accuracy",
+                "std": "sd_balanced_accuracy",
+                "count": "n_subjects",
+            }
+        )
+    )
+    summary["sem_balanced_accuracy"] = (
+        summary["sd_balanced_accuracy"] / np.sqrt(summary["n_subjects"])
+    )
+    summary["error_balanced_accuracy"] = summary[f"{variability}_balanced_accuracy"]
+    summary["variability"] = variability
+
+    print("\nGroup/session balanced accuracy summary:")
+    print(summary.to_string(index=False))
+    return summary
+
+
+def plot_bci_balanced_accuracy_across_sessions(
+    group_summary,
+    variability="sem",
+    save=True,
+    output_path=None,
+):
+    """Plot balanced accuracy across sessions for BCI and control groups."""
+    import matplotlib.pyplot as plt
+
+    if output_path is None:
+        output_path = FIGURES_DIR / "bci_balanced_accuracy_across_sessions.pdf"
+
+    colors = {
+        "experimental": "#DD8452",
+        "control": "#4C72B0",
+    }
+    labels = {
+        "experimental": "BCI",
+        "control": "Mental rehearsal",
+    }
+    group_order = ["experimental", "control"]
+    plotted_values = [0.5]
+
+    with plt.rc_context(_publication_style_rcparams()):
+        fig, ax = plt.subplots(figsize=(4.4, 3.2))
+
+        for group in group_order:
+            group_df = group_summary[group_summary["group"] == group].sort_values("session_id")
+            if group_df.empty:
+                continue
+            yerr = group_df["error_balanced_accuracy"].fillna(0.0)
+            plotted_values.extend((group_df["mean_balanced_accuracy"] - yerr).tolist())
+            plotted_values.extend((group_df["mean_balanced_accuracy"] + yerr).tolist())
+            ax.errorbar(
+                group_df["session_id"],
+                group_df["mean_balanced_accuracy"],
+                yerr=yerr,
+                marker="o",
+                markersize=4.5,
+                capsize=3,
+                capthick=0.8,
+                linewidth=1.5,
+                color=colors[group],
+                label=labels[group],
+                zorder=3,
+            )
+
+        ax.axhline(0.5, color="#777777", linewidth=0.8, linestyle="--", zorder=0)
+        ax.set_xticks([1, 2, 3, 4, 5])
+        ax.set_xlabel("Session")
+        ax.set_ylabel("Balanced accuracy")
+        ax.set_title(f"Balanced Accuracy Across Sessions ({variability.upper()})")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["bottom"].set_linewidth(0.8)
+        ax.spines["left"].set_linewidth(0.8)
+        ax.tick_params(axis="both", which="both", length=3, width=0.8)
+        _set_axis_padding(ax, plotted_values, pad_fraction=0.15, min_pad=0.03)
+        ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), handlelength=1.8)
+        fig.tight_layout(rect=[0, 0, 0.78, 1])
+
+        saved_path = _save_figure_pdf_to_path(fig, output_path) if save else None
+
+    return fig, saved_path
+
+
+def load_and_plot_bci_balanced_accuracy(csv_path=None, variability="sem", save=True, output_path=None):
+    """Load BCI CSV, compute balanced accuracy, and plot it across sessions."""
+    if csv_path is None:
+        csv_path = PROJECT_ROOT / ANALYSES_DIRNAME / "all_subjects_bci.csv"
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Consolidated BCI CSV not found: {csv_path}")
+
+    print("=" * 80)
+    print("BCI BALANCED ACCURACY ACROSS SESSIONS")
+    print("=" * 80)
+    print(f"Loading: {csv_path}")
+    df = pd.read_csv(csv_path)
+
+    ba_results = compute_bci_subject_session_balanced_accuracy(df)
+    group_summary = summarize_bci_balanced_accuracy_by_group(
+        ba_results["subject_session_balanced_accuracy"],
+        variability=variability,
+    )
+    fig, figure_path = plot_bci_balanced_accuracy_across_sessions(
+        group_summary,
+        variability=variability,
+        save=save,
+        output_path=output_path,
+    )
+
+    return {
+        "csv_path": str(csv_path),
+        "dataframe": df,
+        **ba_results,
+        "group_summary": group_summary,
+        "figure": fig,
+        "figure_path": str(figure_path) if figure_path is not None else None,
+    }
+
+
+def compute_adaptive_bci_control_score(df):
+    """Compute run-level and session-level adaptive BCI control scores.
+
+    The run-level score combines adaptive threshold difficulty with balanced
+    accuracy above chance:
+
+    ``adaptive_bci_control_score = threshold_difficulty * (balanced_accuracy - 0.5)``
+
+    Threshold difficulty is ``mean(thrR, thrL, 1 - thrN)``. Balanced accuracy
+    uses ``decoding_task`` as ground truth and ``decoding_bci_output`` as the
+    predicted class, after excluding ambivalent outputs.
+    """
+    required_columns = {
+        "subject_id",
+        "group",
+        "session_id",
+        "run_id",
+        "trial_id",
+        "thrR",
+        "thrL",
+        "thrN",
+        "decoding_task",
+        "decoding_bci_output",
+    }
+    missing_columns = sorted(required_columns - set(df.columns))
+    if missing_columns:
+        raise ValueError(
+            "Adaptive BCI control score analysis is missing required columns: "
+            f"{missing_columns}. Regenerate all_subjects_bci.csv with decoding "
+            "analysis columns before running this analysis."
+        )
+
+    data = df.copy()
+    print("=" * 80)
+    print("ADAPTIVE BCI CONTROL SCORE INPUT VALIDATION")
+    print("=" * 80)
+    print(f"Input trial-level rows: {len(data)}")
+    print(f"Subjects: {data['subject_id'].nunique()}")
+    print(f"Sessions: {sorted(data['session_id'].dropna().unique().tolist())}")
+
+    invalid_groups = sorted(set(data["group"].dropna()) - {"experimental", "control"})
+    if invalid_groups:
+        raise ValueError(
+            "Expected group values to be 'experimental' or 'control'. "
+            f"Found: {invalid_groups}"
+        )
+
+    data["session_id"] = pd.to_numeric(data["session_id"], errors="raise").astype(int)
+    data["run_id"] = pd.to_numeric(data["run_id"], errors="raise").astype(int)
+    data["trial_id"] = pd.to_numeric(data["trial_id"], errors="raise").astype(int)
+    for column in ["thrR", "thrL", "thrN", "decoding_task", "decoding_bci_output"]:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+
+    threshold_missing = (
+        data[["thrR", "thrL", "thrN"]]
+        .isna()
+        .sum()
+        .rename_axis("threshold")
+        .reset_index(name="n_missing_trial_rows")
+    )
+    print("\nMissing threshold values:")
+    print(threshold_missing.to_string(index=False))
+
+    per_run_nunique = (
+        data.groupby(["subject_id", "group", "session_id", "run_id"], observed=False)[
+            ["thrR", "thrL", "thrN"]
+        ]
+        .nunique(dropna=False)
+        .reset_index()
+    )
+    inconsistent_threshold_runs = per_run_nunique[
+        (per_run_nunique[["thrR", "thrL", "thrN"]] > 1).any(axis=1)
+    ]
+    if not inconsistent_threshold_runs.empty:
+        raise ValueError(
+            "Threshold values should be constant within subject/session/run. "
+            "Problem runs:\n"
+            f"{inconsistent_threshold_runs.to_string(index=False)}"
+        )
+
+    run_thresholds = (
+        data[
+            ["subject_id", "group", "session_id", "run_id", "thrR", "thrL", "thrN"]
+        ]
+        .drop_duplicates()
+        .sort_values(["group", "subject_id", "session_id", "run_id"])
+        .reset_index(drop=True)
+    )
+    run_thresholds["difficulty_R"] = run_thresholds["thrR"]
+    run_thresholds["difficulty_L"] = run_thresholds["thrL"]
+    run_thresholds["difficulty_N"] = 1.0 - run_thresholds["thrN"]
+    run_thresholds["threshold_difficulty"] = run_thresholds[
+        ["difficulty_R", "difficulty_L", "difficulty_N"]
+    ].mean(axis=1, skipna=True)
+    print(
+        "\nThreshold aggregation level check: "
+        f"{len(data)} trial rows collapsed to {len(run_thresholds)} unique run rows."
+    )
+
+    missing_label_mask = data["decoding_task"].isna()
+    missing_output_mask = data["decoding_bci_output"].isna()
+    if missing_label_mask.any() or missing_output_mask.any():
+        missing_summary = (
+            data.loc[missing_label_mask | missing_output_mask]
+            .groupby(["subject_id", "group", "session_id", "run_id"], observed=False)
+            .agg(
+                n_missing_decoding_task=("decoding_task", lambda value: value.isna().sum()),
+                n_missing_decoding_bci_output=(
+                    "decoding_bci_output",
+                    lambda value: value.isna().sum(),
+                ),
+            )
+            .reset_index()
+            .sort_values(["group", "subject_id", "session_id", "run_id"])
+        )
+        print("\nRows excluded from balanced accuracy because decoding labels/output are missing:")
+        print(missing_summary.to_string(index=False))
+    else:
+        missing_summary = pd.DataFrame()
+
+    valid = data[
+        data["decoding_task"].notna() & data["decoding_bci_output"].notna()
+    ].copy()
+    valid["decoding_task"] = valid["decoding_task"].astype(int)
+    valid["decoding_bci_output"] = valid["decoding_bci_output"].astype(int)
+
+    invalid_tasks = sorted(set(valid["decoding_task"]) - {0, 1})
+    if invalid_tasks:
+        raise ValueError(f"decoding_task must contain only 0/1 labels. Found: {invalid_tasks}")
+    invalid_outputs = sorted(set(valid["decoding_bci_output"]) - {0, 1, 3})
+    if invalid_outputs:
+        raise ValueError(
+            "decoding_bci_output must contain only 0, 1, or 3. "
+            f"Found: {invalid_outputs}"
+        )
+
+    output_counts = (
+        valid.groupby(["group", "session_id", "decoding_bci_output"], observed=False)
+        .size()
+        .reset_index(name="n_trials")
+        .sort_values(["group", "session_id", "decoding_bci_output"])
+    )
+    print("\nBCI output counts by group/session before excluding ambivalent trials:")
+    print(output_counts.to_string(index=False))
+
+    non_ambivalent = valid[valid["decoding_bci_output"].isin([0, 1])].copy()
+    skipped = []
+    balanced_rows = []
+    for (subject_id, group, session_id, run_id), cell in non_ambivalent.groupby(
+        ["subject_id", "group", "session_id", "run_id"], observed=False
+    ):
+        class_counts = cell["decoding_task"].value_counts().to_dict()
+        if 0 not in class_counts or 1 not in class_counts:
+            skipped.append({
+                "subject_id": subject_id,
+                "group": group,
+                "session_id": int(session_id),
+                "run_id": int(run_id),
+                "n_no_distractor": int(class_counts.get(0, 0)),
+                "n_distractor": int(class_counts.get(1, 0)),
+                "issue": "One ground-truth class absent after ambivalent exclusion.",
+            })
+            continue
+        distractor_trials = cell[cell["decoding_task"] == 1]
+        no_distractor_trials = cell[cell["decoding_task"] == 0]
+        tpr = float((distractor_trials["decoding_bci_output"] == 1).mean())
+        tnr = float((no_distractor_trials["decoding_bci_output"] == 0).mean())
+        balanced_rows.append({
+            "subject_id": subject_id,
+            "group": group,
+            "session_id": int(session_id),
+            "run_id": int(run_id),
+            "balanced_accuracy": (tpr + tnr) / 2.0,
+            "tpr_distractor_accuracy": tpr,
+            "tnr_no_distractor_accuracy": tnr,
+            "n_trials_non_ambivalent": int(len(cell)),
+            "n_distractor_non_ambivalent": int(len(distractor_trials)),
+            "n_no_distractor_non_ambivalent": int(len(no_distractor_trials)),
+        })
+
+    run_balanced_accuracy = pd.DataFrame(balanced_rows)
+    skipped_runs = pd.DataFrame(skipped)
+    if run_balanced_accuracy.empty:
+        raise ValueError("No run-level balanced accuracy rows could be computed.")
+    if not skipped_runs.empty:
+        print("\nRuns skipped for adaptive control score:")
+        print(skipped_runs.to_string(index=False))
+
+    run_scores = run_thresholds.merge(
+        run_balanced_accuracy,
+        on=["subject_id", "group", "session_id", "run_id"],
+        how="inner",
+    )
+    run_scores["above_chance_success"] = run_scores["balanced_accuracy"] - 0.5
+    run_scores["adaptive_bci_control_score"] = (
+        run_scores["threshold_difficulty"] * run_scores["above_chance_success"]
+    )
+    if run_scores.empty:
+        raise ValueError("No run-level adaptive BCI control scores could be computed.")
+
+    print("\nRun-level adaptive BCI control score summary:")
+    print(
+        run_scores[
+            [
+                "subject_id",
+                "group",
+                "session_id",
+                "run_id",
+                "threshold_difficulty",
+                "balanced_accuracy",
+                "above_chance_success",
+                "adaptive_bci_control_score",
+            ]
+        ].head(20).to_string(index=False)
+    )
+
+    subject_session_scores = (
+        run_scores.groupby(["subject_id", "group", "session_id"], observed=False)
+        .agg(
+            mean_threshold_difficulty=("threshold_difficulty", "mean"),
+            mean_balanced_accuracy=("balanced_accuracy", "mean"),
+            mean_above_chance_success=("above_chance_success", "mean"),
+            mean_adaptive_bci_control_score=("adaptive_bci_control_score", "mean"),
+            n_runs=("run_id", "nunique"),
+        )
+        .reset_index()
+        .sort_values(["group", "subject_id", "session_id"])
+    )
+    print("\nSubject-session adaptive control rows:")
+    print(
+        f"{len(subject_session_scores)} rows "
+        f"(full design has {len(EXPECTED_SUBJECTS) * EXPECTED_SESSIONS})."
+    )
+
+    metric_map = {
+        "adaptive_bci_control_score": "mean_adaptive_bci_control_score",
+        "threshold_difficulty": "mean_threshold_difficulty",
+        "balanced_accuracy": "mean_balanced_accuracy",
+    }
+    group_summary = (
+        subject_session_scores.groupby(["group", "session_id"], observed=False)
+        .agg(
+            group_mean_adaptive_bci_control_score=(
+                "mean_adaptive_bci_control_score",
+                "mean",
+            ),
+            group_sd_adaptive_bci_control_score=(
+                "mean_adaptive_bci_control_score",
+                "std",
+            ),
+            group_mean_threshold_difficulty=("mean_threshold_difficulty", "mean"),
+            group_sd_threshold_difficulty=("mean_threshold_difficulty", "std"),
+            group_mean_balanced_accuracy=("mean_balanced_accuracy", "mean"),
+            group_sd_balanced_accuracy=("mean_balanced_accuracy", "std"),
+            n_subjects=("subject_id", "nunique"),
+        )
+        .reset_index()
+        .sort_values(["group", "session_id"])
+    )
+    for metric in metric_map:
+        group_summary[f"group_sem_{metric}"] = (
+            group_summary[f"group_sd_{metric}"] / np.sqrt(group_summary["n_subjects"])
+        )
+    group_summary = group_summary[
+        [
+            "group",
+            "session_id",
+            "group_mean_adaptive_bci_control_score",
+            "group_sem_adaptive_bci_control_score",
+            "group_mean_threshold_difficulty",
+            "group_sem_threshold_difficulty",
+            "group_mean_balanced_accuracy",
+            "group_sem_balanced_accuracy",
+            "n_subjects",
+        ]
+    ]
+    print("\nGroup-level adaptive control summary:")
+    print(group_summary.to_string(index=False))
+
+    return {
+        "run_scores": run_scores,
+        "subject_session_scores": subject_session_scores,
+        "group_summary": group_summary,
+        "run_balanced_accuracy": run_balanced_accuracy,
+        "run_thresholds": run_thresholds,
+        "output_counts": output_counts,
+        "missing_summary": missing_summary,
+        "skipped_runs": skipped_runs,
+    }
+
+
+def plot_adaptive_bci_control_metric(
+    subject_session_scores,
+    group_summary,
+    metric,
+    ylabel,
+    title,
+    save=True,
+    output_path=None,
+):
+    """Plot one adaptive-control metric across sessions with group SEM error bars."""
+    import matplotlib.pyplot as plt
+
+    metric_columns = {
+        "adaptive_bci_control_score": {
+            "subject": "mean_adaptive_bci_control_score",
+            "group_mean": "group_mean_adaptive_bci_control_score",
+            "group_sem": "group_sem_adaptive_bci_control_score",
+        },
+        "threshold_difficulty": {
+            "subject": "mean_threshold_difficulty",
+            "group_mean": "group_mean_threshold_difficulty",
+            "group_sem": "group_sem_threshold_difficulty",
+        },
+        "balanced_accuracy": {
+            "subject": "mean_balanced_accuracy",
+            "group_mean": "group_mean_balanced_accuracy",
+            "group_sem": "group_sem_balanced_accuracy",
+        },
+    }
+    if metric not in metric_columns:
+        raise ValueError(f"Unknown metric {metric}. Expected one of {sorted(metric_columns)}.")
+
+    if output_path is None:
+        output_path = FIGURES_DIR / f"adaptive_bci_{metric}_across_sessions.pdf"
+
+    cols = metric_columns[metric]
+    colors = {
+        "experimental": "#DD8452",
+        "control": "#4C72B0",
+    }
+    labels = {
+        "experimental": "BCI",
+        "control": "Mental rehearsal",
+    }
+    group_order = ["experimental", "control"]
+    plotted_values = []
+
+    with plt.rc_context(_publication_style_rcparams()):
+        fig, ax = plt.subplots(figsize=(4.8, 3.2))
+
+        for group in group_order:
+            group_df = group_summary[group_summary["group"] == group].sort_values("session_id")
+            if group_df.empty:
+                continue
+            y = group_df[cols["group_mean"]]
+            yerr = group_df[cols["group_sem"]].fillna(0.0)
+            plotted_values.extend((y - yerr).tolist())
+            plotted_values.extend((y + yerr).tolist())
+            ax.errorbar(
+                group_df["session_id"],
+                y,
+                yerr=yerr,
+                marker="o",
+                markersize=4.8,
+                capsize=3,
+                capthick=0.8,
+                linewidth=1.7,
+                color=colors[group],
+                label=labels[group],
+                zorder=3,
+            )
+
+        if metric in {"balanced_accuracy", "adaptive_bci_control_score"}:
+            ax.axhline(
+                0.5 if metric == "balanced_accuracy" else 0.0,
+                color="#777777",
+                linewidth=0.8,
+                linestyle="--",
+                zorder=0,
+            )
+            plotted_values.append(0.5 if metric == "balanced_accuracy" else 0.0)
+
+        ax.set_xticks([1, 2, 3, 4, 5])
+        ax.set_xlabel("Session")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["bottom"].set_linewidth(0.8)
+        ax.spines["left"].set_linewidth(0.8)
+        ax.tick_params(axis="both", which="both", length=3, width=0.8)
+        _set_axis_padding(ax, plotted_values, pad_fraction=0.15, min_pad=0.02)
+        ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), handlelength=1.8)
+        fig.tight_layout(rect=[0, 0, 0.78, 1])
+
+        saved_path = _save_figure_pdf_to_path(fig, output_path) if save else None
+
+    return fig, saved_path
+
+
+def plot_adaptive_bci_control_score_summary(
+    subject_session_scores,
+    group_summary,
+    save=True,
+    output_dir=None,
+):
+    """Generate adaptive control, threshold difficulty, and balanced accuracy plots."""
+    if output_dir is None:
+        output_dir = FIGURES_DIR
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    plot_specs = {
+        "adaptive_bci_control_score": {
+            "ylabel": "Adaptive BCI control score",
+            "title": "Adaptive BCI Control Score Across Sessions",
+            "path": output_dir / "adaptive_bci_control_score_across_sessions.pdf",
+        },
+        "threshold_difficulty": {
+            "ylabel": "Threshold difficulty",
+            "title": "Threshold Difficulty Across Sessions",
+            "path": output_dir / "adaptive_bci_threshold_difficulty_across_sessions.pdf",
+        },
+        "balanced_accuracy": {
+            "ylabel": "Balanced accuracy",
+            "title": "Balanced Accuracy Across Sessions",
+            "path": output_dir / "adaptive_bci_balanced_accuracy_across_sessions.pdf",
+        },
+    }
+
+    figures = {}
+    figure_paths = {}
+    for metric, spec in plot_specs.items():
+        fig, path = plot_adaptive_bci_control_metric(
+            subject_session_scores,
+            group_summary,
+            metric=metric,
+            ylabel=spec["ylabel"],
+            title=spec["title"],
+            save=save,
+            output_path=spec["path"],
+        )
+        figures[metric] = fig
+        figure_paths[metric] = str(path) if path is not None else None
+
+    return figures, figure_paths
+
+
+def load_compute_and_plot_adaptive_bci_control_score(
+    csv_path=None,
+    save=True,
+    output_dir=None,
+):
+    """Load BCI CSV, compute adaptive BCI control score, and generate plots."""
+    if csv_path is None:
+        csv_path = PROJECT_ROOT / ANALYSES_DIRNAME / "all_subjects_bci.csv"
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Consolidated BCI CSV not found: {csv_path}")
+
+    print("=" * 80)
+    print("ADAPTIVE BCI CONTROL SCORE ACROSS SESSIONS")
+    print("=" * 80)
+    print(f"Loading: {csv_path}")
+    df = pd.read_csv(csv_path)
+
+    score_results = compute_adaptive_bci_control_score(df)
+    figures, figure_paths = plot_adaptive_bci_control_score_summary(
+        score_results["subject_session_scores"],
+        score_results["group_summary"],
+        save=save,
+        output_dir=output_dir,
+    )
+
+    return {
+        "csv_path": str(csv_path),
+        "dataframe": df,
+        **score_results,
+        "figures": figures,
+        "figure_paths": figure_paths,
+    }
+
+
 def compute_subject_averaged_posterior_distributions(
     df,
     sessions=(1, 5),
@@ -2551,6 +3318,1351 @@ def load_and_plot_bci_combined_threshold_change_session1_to_session5(
         **threshold_results,
         "figure": fig,
         "figure_path": str(figure_path) if figure_path is not None else None,
+    }
+
+
+def compute_bci_threshold_trajectories(df, variability="sem"):
+    """Compute group-level BCI threshold trajectories across runs and sessions.
+
+    The consolidated BCI CSV is trial-level, but ``thrR``, ``thrL``, and ``thrN``
+    are run-level values repeated on each trial. This function validates that
+    repetition, collapses to subject/session/run rows, transforms the
+    no-distractor threshold as ``1 - thrN``, and then averages across subjects.
+    """
+    required_columns = {
+        "subject_id",
+        "group",
+        "session_id",
+        "run_id",
+        "trial_id",
+        "thrR",
+        "thrL",
+        "thrN",
+    }
+    missing_columns = sorted(required_columns - set(df.columns))
+    if missing_columns:
+        raise ValueError(
+            "Threshold trajectory analysis is missing required columns: "
+            f"{missing_columns}."
+        )
+    if variability not in {"sem", "sd"}:
+        raise ValueError("variability must be 'sem' or 'sd'.")
+
+    data = df.copy()
+    print("=" * 80)
+    print("BCI THRESHOLD TRAJECTORY INPUT VALIDATION")
+    print("=" * 80)
+    print(f"Input trial-level rows: {len(data)}")
+
+    invalid_groups = sorted(set(data["group"].dropna()) - {"experimental", "control"})
+    if invalid_groups:
+        raise ValueError(
+            "Expected group values to be 'experimental' or 'control'. "
+            f"Found: {invalid_groups}"
+        )
+
+    data["session_id"] = pd.to_numeric(data["session_id"], errors="raise").astype(int)
+    data["run_id"] = pd.to_numeric(data["run_id"], errors="raise").astype(int)
+    data["trial_id"] = pd.to_numeric(data["trial_id"], errors="raise").astype(int)
+    for column in ["thrR", "thrL", "thrN"]:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+
+    missing_thresholds = (
+        data[["thrR", "thrL", "thrN"]]
+        .isna()
+        .sum()
+        .rename_axis("threshold")
+        .reset_index(name="n_missing_trial_rows")
+    )
+    print("\nMissing threshold values in trial-level CSV:")
+    print(missing_thresholds.to_string(index=False))
+
+    per_run_nunique = (
+        data.groupby(["subject_id", "group", "session_id", "run_id"], observed=False)[
+            ["thrR", "thrL", "thrN"]
+        ]
+        .nunique(dropna=False)
+        .reset_index()
+    )
+    inconsistent_runs = per_run_nunique[
+        (per_run_nunique[["thrR", "thrL", "thrN"]] > 1).any(axis=1)
+    ]
+    if not inconsistent_runs.empty:
+        raise ValueError(
+            "Threshold values should be constant within each subject/session/run. "
+            "Problem runs:\n"
+            f"{inconsistent_runs.to_string(index=False)}"
+        )
+
+    trial_counts_per_run = (
+        data.groupby(["subject_id", "group", "session_id", "run_id"], observed=False)
+        .size()
+        .reset_index(name="n_trial_rows")
+    )
+    unexpected_trial_counts = trial_counts_per_run[
+        trial_counts_per_run["n_trial_rows"] != TRIALS_PER_BCI_RUN
+    ]
+    if not unexpected_trial_counts.empty:
+        print(
+            "\nRuns with trial-row counts different from "
+            f"{TRIALS_PER_BCI_RUN}; retained for threshold plotting because "
+            "thresholds are run-level values:"
+        )
+        print(unexpected_trial_counts.to_string(index=False))
+    else:
+        print(f"\nTrial count check: PASS ({TRIALS_PER_BCI_RUN} rows per run).")
+
+    run_level = (
+        data[
+            ["subject_id", "group", "session_id", "run_id", "thrR", "thrL", "thrN"]
+        ]
+        .drop_duplicates()
+        .merge(
+            trial_counts_per_run,
+            on=["subject_id", "group", "session_id", "run_id"],
+            how="left",
+        )
+        .sort_values(["group", "subject_id", "session_id", "run_id"])
+        .reset_index(drop=True)
+    )
+    print(
+        "\nThreshold aggregation level check: "
+        f"{len(data)} trial rows collapsed to {len(run_level)} unique run rows."
+    )
+
+    expected_run_counts = pd.DataFrame(
+        [
+            {"session_id": session_id, "expected_n_runs": n_runs}
+            for session_id, n_runs in EXPECTED_REAL_RUNS_BY_SESSION.items()
+        ]
+    )
+    observed_run_counts = (
+        run_level.groupby(["subject_id", "group", "session_id"], observed=False)["run_id"]
+        .nunique()
+        .reset_index(name="n_run_rows")
+        .merge(expected_run_counts, on="session_id", how="left")
+        .sort_values(["group", "subject_id", "session_id"])
+    )
+    mismatched_run_counts = observed_run_counts[
+        observed_run_counts["n_run_rows"] != observed_run_counts["expected_n_runs"]
+    ]
+    print("\nRun rows available per subject/session:")
+    print(observed_run_counts.to_string(index=False))
+    if not mismatched_run_counts.empty:
+        print("\nSubject/sessions with documented or data-driven run-count mismatches:")
+        print(mismatched_run_counts.to_string(index=False))
+
+    subjects_by_group = (
+        run_level[["subject_id", "group"]]
+        .drop_duplicates()
+        .groupby("group", observed=False)
+        .size()
+        .reset_index(name="n_subjects")
+        .sort_values("group")
+    )
+    print("\nSubjects contributing threshold trajectories:")
+    print(subjects_by_group.to_string(index=False))
+
+    separate_subject_run = run_level.copy()
+    separate_subject_run["thrN"] = 1.0 - separate_subject_run["thrN"]
+    separate_long = separate_subject_run.melt(
+        id_vars=["subject_id", "group", "session_id", "run_id", "n_trial_rows"],
+        value_vars=["thrR", "thrL", "thrN"],
+        var_name="threshold_type",
+        value_name="threshold_value",
+    )
+
+    combined_subject_run = separate_subject_run[
+        ["subject_id", "group", "session_id", "run_id", "n_trial_rows", "thrR", "thrL", "thrN"]
+    ].copy()
+    combined_subject_run["distractor"] = combined_subject_run[["thrR", "thrL"]].mean(axis=1)
+    combined_subject_run["no_distractor"] = combined_subject_run["thrN"]
+    combined_long = combined_subject_run.melt(
+        id_vars=["subject_id", "group", "session_id", "run_id", "n_trial_rows"],
+        value_vars=["distractor", "no_distractor"],
+        var_name="threshold_type",
+        value_name="threshold_value",
+    )
+
+    def _summarize(subject_run_long, threshold_order):
+        summary = (
+            subject_run_long
+            .groupby(["group", "session_id", "run_id", "threshold_type"], observed=False)[
+                "threshold_value"
+            ]
+            .agg(["mean", "std", "count"])
+            .reset_index()
+            .rename(
+                columns={
+                    "mean": "mean_threshold",
+                    "std": "sd_threshold",
+                    "count": "n_subjects",
+                }
+            )
+        )
+        summary["sem_threshold"] = summary["sd_threshold"] / np.sqrt(summary["n_subjects"])
+        summary["error_threshold"] = summary[f"{variability}_threshold"]
+        summary["variability"] = variability
+        summary["threshold_type"] = pd.Categorical(
+            summary["threshold_type"],
+            categories=threshold_order,
+            ordered=True,
+        )
+        return summary.sort_values(
+            ["group", "threshold_type", "session_id", "run_id"]
+        ).reset_index(drop=True)
+
+    separate_summary = _summarize(separate_long, ["thrR", "thrL", "thrN"])
+    combined_summary = _summarize(combined_long, ["distractor", "no_distractor"])
+
+    print(f"\nGroup/run threshold summary using shaded {variability.upper()}:")
+    print(separate_summary.head(20).to_string(index=False))
+    print("\nCombined distractor threshold summary:")
+    print(combined_summary.head(20).to_string(index=False))
+
+    return {
+        "run_level_thresholds": run_level,
+        "observed_run_counts": observed_run_counts,
+        "mismatched_run_counts": mismatched_run_counts,
+        "missing_thresholds": missing_thresholds,
+        "separate_subject_run_thresholds": separate_long,
+        "combined_subject_run_thresholds": combined_long,
+        "separate_summary": separate_summary,
+        "combined_summary": combined_summary,
+        "variability": variability,
+    }
+
+
+def _threshold_trajectory_x_positions(session_run_counts=None, session_gap=1.5):
+    if session_run_counts is None:
+        session_run_counts = EXPECTED_REAL_RUNS_BY_SESSION
+    positions = {}
+    ticks = []
+    ticklabels = []
+    session_centers = []
+    cursor = 0.0
+    for session_id in sorted(session_run_counts):
+        n_runs = int(session_run_counts[session_id])
+        run_positions = []
+        for run_id in range(1, n_runs + 1):
+            x = cursor + run_id
+            positions[(int(session_id), int(run_id))] = x
+            ticks.append(x)
+            ticklabels.append(str(run_id))
+            run_positions.append(x)
+        if run_positions:
+            session_centers.append({
+                "session_id": int(session_id),
+                "x": float(np.mean(run_positions)),
+            })
+        cursor += n_runs + float(session_gap)
+    return positions, ticks, ticklabels, session_centers
+
+
+def plot_bci_threshold_trajectories(
+    summary,
+    threshold_order,
+    threshold_labels,
+    save=True,
+    output_path=None,
+    title="BCI Threshold Trajectories",
+    variability="sem",
+    session_gap=1.5,
+    show_threshold_legend=True,
+    show_session_labels=True,
+    force_solid_lines=False,
+    y_limits=None,
+):
+    """Plot group-averaged threshold trajectories with session breaks."""
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    group_order = ["experimental", "control"]
+    colors = {
+        "experimental": "#DD8452",
+        "control": "#4C72B0",
+    }
+    group_labels = {
+        "experimental": "BCI",
+        "control": "Mental rehearsal",
+    }
+    linestyles = {
+        "thrR": "-",
+        "thrL": "--",
+        "thrN": ":",
+        "distractor": "-",
+        "no_distractor": ":",
+    }
+    if force_solid_lines:
+        linestyles = {threshold_type: "-" for threshold_type in linestyles}
+
+    if output_path is None:
+        output_path = FIGURES_DIR / "bci_threshold_trajectories.pdf"
+
+    summary = summary.copy()
+    summary["threshold_type"] = summary["threshold_type"].astype(str)
+    x_positions, ticks, ticklabels, session_centers = _threshold_trajectory_x_positions(
+        session_gap=session_gap
+    )
+    summary["x"] = [
+        x_positions.get((int(row.session_id), int(row.run_id)), np.nan)
+        for row in summary.itertuples(index=False)
+    ]
+    summary = summary.dropna(subset=["x", "mean_threshold"])
+
+    plotted_values = []
+    with plt.rc_context(_publication_style_rcparams()):
+        fig, ax = plt.subplots(figsize=(7.2, 3.3))
+
+        for group in group_order:
+            for threshold_type in threshold_order:
+                line_df = summary[
+                    (summary["group"] == group)
+                    & (summary["threshold_type"] == threshold_type)
+                ].sort_values(["session_id", "run_id"])
+                if line_df.empty:
+                    continue
+
+                for _, session_df in line_df.groupby("session_id", sort=True):
+                    x = session_df["x"].to_numpy(dtype=float)
+                    y = session_df["mean_threshold"].to_numpy(dtype=float)
+                    err = session_df["error_threshold"].fillna(0.0).to_numpy(dtype=float)
+                    plotted_values.extend((y - err).tolist())
+                    plotted_values.extend((y + err).tolist())
+                    ax.plot(
+                        x,
+                        y,
+                        color=colors[group],
+                        linestyle=linestyles[threshold_type],
+                        linewidth=1.6,
+                        zorder=3,
+                    )
+                    ax.fill_between(
+                        x,
+                        y - err,
+                        y + err,
+                        color=colors[group],
+                        alpha=0.14,
+                        linewidth=0,
+                        zorder=2,
+                    )
+
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(ticklabels)
+        ax.set_xlabel("Run number within session")
+        ax.set_ylabel("Threshold value")
+        ax.set_title(title)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["bottom"].set_linewidth(0.8)
+        ax.spines["left"].set_linewidth(0.8)
+        ax.tick_params(axis="both", which="both", length=3, width=0.8)
+
+        if show_session_labels:
+            y_text = 1.01
+            for item in session_centers:
+                ax.text(
+                    item["x"],
+                    y_text,
+                    f"S{item['session_id']}",
+                    transform=ax.get_xaxis_transform(),
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+
+        group_handles = [
+            Line2D([0], [0], color=colors[group], lw=1.8, label=group_labels[group])
+            for group in group_order
+        ]
+        threshold_handles = [
+            Line2D(
+                [0],
+                [0],
+                color="#333333",
+                lw=1.8,
+                linestyle=linestyles[threshold_type],
+                label=threshold_labels[threshold_type],
+            )
+            for threshold_type in threshold_order
+        ]
+        if show_threshold_legend:
+            legend1 = ax.legend(
+                handles=group_handles,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.66),
+                title="Group",
+                handlelength=2.4,
+            )
+            ax.add_artist(legend1)
+            ax.legend(
+                handles=threshold_handles,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.28),
+                title="Threshold",
+                handlelength=2.4,
+            )
+        else:
+            ax.legend(
+                handles=group_handles,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
+                title="Group",
+                handlelength=2.4,
+            )
+
+        if y_limits is not None:
+            ax.set_ylim(*y_limits)
+        else:
+            _set_axis_padding(
+                ax,
+                plotted_values,
+                pad_fraction=0.12,
+                min_pad=0.02,
+                lower_bound=0.0,
+                upper_bound=1.0,
+            )
+        fig.tight_layout(rect=[0, 0, 0.78, 0.96])
+
+        saved_path = _save_figure_pdf_to_path(fig, output_path) if save else None
+
+    return fig, saved_path
+
+
+def load_and_plot_bci_threshold_trajectories(
+    csv_path=None,
+    variability="sem",
+    save=True,
+    separate_output_path=None,
+    combined_output_path=None,
+):
+    """Load all_subjects_bci.csv and plot separate and combined threshold trajectories."""
+    if csv_path is None:
+        csv_path = PROJECT_ROOT / ANALYSES_DIRNAME / "all_subjects_bci.csv"
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Consolidated BCI CSV not found: {csv_path}")
+
+    print("=" * 80)
+    print("BCI THRESHOLD TRAJECTORIES ACROSS RUNS")
+    print("=" * 80)
+    print(f"Loading: {csv_path}")
+    df = pd.read_csv(csv_path)
+
+    trajectory_results = compute_bci_threshold_trajectories(df, variability=variability)
+
+    if separate_output_path is None:
+        separate_output_path = FIGURES_DIR / "bci_threshold_trajectories_thrR_thrL_thrN.pdf"
+    if combined_output_path is None:
+        combined_output_path = FIGURES_DIR / "bci_threshold_trajectories_combined_distractor.pdf"
+
+    separate_fig, separate_figure_path = plot_bci_threshold_trajectories(
+        trajectory_results["separate_summary"],
+        threshold_order=["thrR", "thrL", "thrN"],
+        threshold_labels={
+            "thrR": "thrR",
+            "thrL": "thrL",
+            "thrN": "1 - thrN",
+        },
+        save=save,
+        output_path=separate_output_path,
+        title=f"Threshold Trajectories Across BCI Runs ({variability.upper()})",
+        variability=variability,
+    )
+    combined_fig, combined_figure_path = plot_bci_threshold_trajectories(
+        trajectory_results["combined_summary"],
+        threshold_order=["distractor", "no_distractor"],
+        threshold_labels={
+            "distractor": "mean(thrR, thrL)",
+            "no_distractor": "1 - thrN",
+        },
+        save=save,
+        output_path=combined_output_path,
+        title=f"Combined Threshold Trajectories Across BCI Runs ({variability.upper()})",
+        variability=variability,
+    )
+
+    return {
+        "csv_path": str(csv_path),
+        "dataframe": df,
+        **trajectory_results,
+        "separate_figure": separate_fig,
+        "separate_figure_path": (
+            str(separate_figure_path) if separate_figure_path is not None else None
+        ),
+        "combined_figure": combined_fig,
+        "combined_figure_path": (
+            str(combined_figure_path) if combined_figure_path is not None else None
+        ),
+    }
+
+
+def load_and_plot_bci_threshold_trajectory_panels(
+    csv_path=None,
+    variability="sem",
+    save=True,
+    distractor_output_path=None,
+    no_distractor_output_path=None,
+):
+    """Plot separate distractor and no-distractor threshold trajectory figures."""
+    if csv_path is None:
+        csv_path = PROJECT_ROOT / ANALYSES_DIRNAME / "all_subjects_bci.csv"
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Consolidated BCI CSV not found: {csv_path}")
+
+    print("=" * 80)
+    print("BCI SPLIT THRESHOLD TRAJECTORIES ACROSS RUNS")
+    print("=" * 80)
+    print(f"Loading: {csv_path}")
+    df = pd.read_csv(csv_path)
+
+    trajectory_results = compute_bci_threshold_trajectories(df, variability=variability)
+    combined_summary = trajectory_results["combined_summary"].copy()
+
+    if distractor_output_path is None:
+        distractor_output_path = (
+            FIGURES_DIR / "threshold_trajectory_distractor_class_by_group_clean.pdf"
+        )
+    if no_distractor_output_path is None:
+        no_distractor_output_path = (
+            FIGURES_DIR / "threshold_trajectory_no_distractor_class_by_group_clean.pdf"
+        )
+
+    distractor_summary = combined_summary[
+        combined_summary["threshold_type"].astype(str) == "distractor"
+    ].copy()
+    no_distractor_summary = combined_summary[
+        combined_summary["threshold_type"].astype(str) == "no_distractor"
+    ].copy()
+
+    distractor_fig, distractor_figure_path = plot_bci_threshold_trajectories(
+        distractor_summary,
+        threshold_order=["distractor"],
+        threshold_labels={"distractor": "Distractor class threshold"},
+        save=save,
+        output_path=distractor_output_path,
+        title=f"Distractor class thresholds across runs ({variability.upper()})",
+        variability=variability,
+        show_threshold_legend=False,
+        show_session_labels=False,
+        force_solid_lines=True,
+        y_limits=(0.18, 0.35),
+    )
+    no_distractor_fig, no_distractor_figure_path = plot_bci_threshold_trajectories(
+        no_distractor_summary,
+        threshold_order=["no_distractor"],
+        threshold_labels={"no_distractor": "No distractor class threshold"},
+        save=save,
+        output_path=no_distractor_output_path,
+        title=f"No distractor class thresholds across runs ({variability.upper()})",
+        variability=variability,
+        show_threshold_legend=False,
+        show_session_labels=False,
+        force_solid_lines=True,
+        y_limits=(0.18, 0.35),
+    )
+
+    return {
+        "csv_path": str(csv_path),
+        "dataframe": df,
+        **trajectory_results,
+        "distractor_summary": distractor_summary,
+        "no_distractor_summary": no_distractor_summary,
+        "distractor_figure": distractor_fig,
+        "distractor_figure_path": (
+            str(distractor_figure_path) if distractor_figure_path is not None else None
+        ),
+        "no_distractor_figure": no_distractor_fig,
+        "no_distractor_figure_path": (
+            str(no_distractor_figure_path)
+            if no_distractor_figure_path is not None
+            else None
+        ),
+    }
+
+
+def _holm_bonferroni(p_values):
+    """Return Holm-Bonferroni adjusted p-values in original order."""
+    p_values = np.asarray(p_values, dtype=float)
+    adjusted = np.full(p_values.shape, np.nan, dtype=float)
+    valid_mask = np.isfinite(p_values)
+    valid_indices = np.where(valid_mask)[0]
+    if len(valid_indices) == 0:
+        return adjusted
+
+    valid_p = p_values[valid_indices]
+    order = np.argsort(valid_p)
+    sorted_p = valid_p[order]
+    m = len(sorted_p)
+    sorted_adjusted = np.empty(m, dtype=float)
+    running_max = 0.0
+    for rank, p_value in enumerate(sorted_p):
+        candidate = (m - rank) * p_value
+        running_max = max(running_max, candidate)
+        sorted_adjusted[rank] = min(running_max, 1.0)
+
+    adjusted_valid = np.empty(m, dtype=float)
+    adjusted_valid[order] = sorted_adjusted
+    adjusted[valid_indices] = adjusted_valid
+    return adjusted
+
+
+def run_bci_threshold_trajectory_regression_stats(
+    df,
+    correction="holm",
+    save=True,
+    output_dir=None,
+):
+    """Test whether threshold trajectories increase across runs and sessions.
+
+    This uses subject-level run rows from ``all_subjects_bci.csv``. The
+    distractor class threshold is ``mean(thrR, thrL)`` at each subject/run, and
+    the no-distractor class threshold is ``1 - thrN``. Overall tests fit one
+    linear slope per subject across the 36-run sequence, then test whether
+    slopes are greater than zero within each group and threshold class. Per-session
+    tests fit one within-session slope per subject/session and test those slopes
+    against zero by group, session, and threshold class.
+    """
+    from scipy import stats
+
+    if correction != "holm":
+        raise ValueError("Only correction='holm' is currently supported.")
+
+    print("=" * 80)
+    print("BCI THRESHOLD TRAJECTORY REGRESSION STATISTICS")
+    print("=" * 80)
+    print("Distractor class threshold: mean(thrR, thrL)")
+    print("No distractor class threshold: 1 - thrN")
+    print("Overall test: subject-level linear slopes across the full run sequence.")
+    print("Per-session test: subject-level linear slopes across runs within each session.")
+    print("P-values are one-sided for increases; Holm correction is applied by family.")
+
+    trajectory_results = compute_bci_threshold_trajectories(df, variability="sem")
+    subject_run = trajectory_results["combined_subject_run_thresholds"].copy()
+
+    session_offsets = {}
+    cursor = 0
+    for session_id in sorted(EXPECTED_REAL_RUNS_BY_SESSION):
+        session_offsets[int(session_id)] = cursor
+        cursor += int(EXPECTED_REAL_RUNS_BY_SESSION[session_id])
+    expected_total_runs = cursor
+    subject_run["global_run_index"] = [
+        session_offsets[int(row.session_id)] + int(row.run_id)
+        for row in subject_run.itertuples(index=False)
+    ]
+    subject_run = subject_run[
+        subject_run["global_run_index"].between(1, expected_total_runs)
+    ].copy()
+
+    slope_rows = []
+    for (subject_id, group, threshold_type), cell in subject_run.groupby(
+        ["subject_id", "group", "threshold_type"], observed=False
+    ):
+        cell = cell.dropna(subset=["global_run_index", "threshold_value"]).sort_values(
+            "global_run_index"
+        )
+        if len(cell) < 2:
+            continue
+        slope, intercept = np.polyfit(
+            cell["global_run_index"].to_numpy(dtype=float),
+            cell["threshold_value"].to_numpy(dtype=float),
+            1,
+        )
+        slope_rows.append({
+            "subject_id": subject_id,
+            "group": group,
+            "threshold_type": threshold_type,
+            "slope_per_run": slope,
+            "intercept": intercept,
+            "n_runs": len(cell),
+            "first_global_run": int(cell["global_run_index"].min()),
+            "last_global_run": int(cell["global_run_index"].max()),
+        })
+    subject_slopes = pd.DataFrame(slope_rows)
+    if subject_slopes.empty:
+        raise ValueError("No subject-level slopes could be computed.")
+
+    overall_rows = []
+    for (group, threshold_type), cell in subject_slopes.groupby(
+        ["group", "threshold_type"], observed=False
+    ):
+        slopes = cell["slope_per_run"].dropna().to_numpy(dtype=float)
+        if len(slopes) < 2:
+            t_stat = np.nan
+            p_two_sided = np.nan
+            p_increase = np.nan
+            mean_slope = np.nan if len(slopes) == 0 else float(np.mean(slopes))
+            sd_slope = np.nan
+            sem_slope = np.nan
+        else:
+            test = stats.ttest_1samp(slopes, popmean=0.0, alternative="greater")
+            two_sided = stats.ttest_1samp(slopes, popmean=0.0, alternative="two-sided")
+            t_stat = float(test.statistic)
+            p_increase = float(test.pvalue)
+            p_two_sided = float(two_sided.pvalue)
+            mean_slope = float(np.mean(slopes))
+            sd_slope = float(np.std(slopes, ddof=1))
+            sem_slope = float(sd_slope / np.sqrt(len(slopes)))
+        overall_rows.append({
+            "group": group,
+            "threshold_type": threshold_type,
+            "n_subjects": int(len(slopes)),
+            "mean_slope_per_run": mean_slope,
+            "sd_slope_per_run": sd_slope,
+            "sem_slope_per_run": sem_slope,
+            "t_statistic": t_stat,
+            "df": int(len(slopes) - 1),
+            "p_one_sided_increase": p_increase,
+            "p_two_sided": p_two_sided,
+        })
+    overall_tests = pd.DataFrame(overall_rows).sort_values(
+        ["threshold_type", "group"]
+    ).reset_index(drop=True)
+    overall_tests["p_holm_overall_family"] = _holm_bonferroni(
+        overall_tests["p_one_sided_increase"]
+    )
+    overall_tests["significant_holm_0_05"] = (
+        overall_tests["p_holm_overall_family"] < 0.05
+    )
+
+    session_slope_rows = []
+    for (subject_id, group, session_id, threshold_type), cell in subject_run.groupby(
+        ["subject_id", "group", "session_id", "threshold_type"], observed=False
+    ):
+        cell = cell.dropna(subset=["run_id", "threshold_value"]).sort_values("run_id")
+        if len(cell) < 2:
+            continue
+        slope, intercept = np.polyfit(
+            cell["run_id"].to_numpy(dtype=float),
+            cell["threshold_value"].to_numpy(dtype=float),
+            1,
+        )
+        session_slope_rows.append({
+            "subject_id": subject_id,
+            "group": group,
+            "session_id": int(session_id),
+            "threshold_type": threshold_type,
+            "slope_per_run_within_session": slope,
+            "intercept": intercept,
+            "n_runs": len(cell),
+            "first_run": int(cell["run_id"].min()),
+            "last_run": int(cell["run_id"].max()),
+        })
+    session_slopes = pd.DataFrame(session_slope_rows)
+    if session_slopes.empty:
+        raise ValueError("No session-level slopes could be computed.")
+
+    session_rows = []
+    for (group, threshold_type, session_id), cell in session_slopes.groupby(
+        ["group", "threshold_type", "session_id"], observed=False
+    ):
+        slopes = cell["slope_per_run_within_session"].dropna().to_numpy(dtype=float)
+        if len(slopes) < 2:
+            t_stat = np.nan
+            p_two_sided = np.nan
+            p_increase = np.nan
+            mean_slope = np.nan if len(slopes) == 0 else float(np.mean(slopes))
+            sd_slope = np.nan
+            sem_slope = np.nan
+        else:
+            test = stats.ttest_1samp(slopes, popmean=0.0, alternative="greater")
+            two_sided = stats.ttest_1samp(slopes, popmean=0.0, alternative="two-sided")
+            t_stat = float(test.statistic)
+            p_increase = float(test.pvalue)
+            p_two_sided = float(two_sided.pvalue)
+            mean_slope = float(np.mean(slopes))
+            sd_slope = float(np.std(slopes, ddof=1))
+            sem_slope = float(sd_slope / np.sqrt(len(slopes)))
+        session_rows.append({
+            "group": group,
+            "threshold_type": threshold_type,
+            "session_id": int(session_id),
+            "n_subjects": int(len(slopes)),
+            "mean_slope_per_run_within_session": mean_slope,
+            "sd_slope_per_run_within_session": sd_slope,
+            "sem_slope_per_run_within_session": sem_slope,
+            "t_statistic": t_stat,
+            "df": int(len(slopes) - 1),
+            "p_one_sided_increase": p_increase,
+            "p_two_sided": p_two_sided,
+        })
+    session_tests = pd.DataFrame(session_rows)
+    if not session_tests.empty:
+        session_tests = session_tests.sort_values(
+            ["threshold_type", "group", "session_id"]
+        ).reset_index(drop=True)
+        session_tests["p_holm_session_family"] = _holm_bonferroni(
+            session_tests["p_one_sided_increase"]
+        )
+        session_tests["significant_holm_0_05"] = (
+            session_tests["p_holm_session_family"] < 0.05
+        )
+        session_tests["significant_uncorrected_0_05"] = (
+            session_tests["p_one_sided_increase"] < 0.05
+        )
+
+    print("\nOverall full-sequence subject-slope tests:")
+    print(overall_tests.to_string(index=False))
+    print("\nPer-session subject-slope tests passing Holm p < .05:")
+    if session_tests.empty or not session_tests["significant_holm_0_05"].any():
+        print("None.")
+    else:
+        print(
+            session_tests[session_tests["significant_holm_0_05"]]
+            .to_string(index=False)
+        )
+
+    output_paths = {}
+    if save:
+        if output_dir is None:
+            output_dir = REPO_ROOT / ANALYSES_DIRNAME
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_paths = {
+            "subject_slopes": output_dir / "bci_threshold_subject_full_sequence_slopes.csv",
+            "overall_tests": output_dir / "bci_threshold_overall_slope_tests.csv",
+            "session_slopes": output_dir / "bci_threshold_subject_session_slopes.csv",
+            "session_tests": output_dir / "bci_threshold_session_slope_tests.csv",
+        }
+        subject_slopes.to_csv(output_paths["subject_slopes"], index=False)
+        overall_tests.to_csv(output_paths["overall_tests"], index=False)
+        session_slopes.to_csv(output_paths["session_slopes"], index=False)
+        session_tests.to_csv(output_paths["session_tests"], index=False)
+        print("\nSaved threshold statistics tables:")
+        for label, path in output_paths.items():
+            print(f"- {label}: {path}")
+
+    return {
+        **trajectory_results,
+        "subject_run_thresholds_with_global_index": subject_run,
+        "subject_slopes": subject_slopes,
+        "overall_tests": overall_tests,
+        "session_slopes": session_slopes,
+        "session_tests": session_tests,
+        "correction": correction,
+        "output_paths": {key: str(path) for key, path in output_paths.items()},
+    }
+
+
+def load_and_run_bci_threshold_trajectory_regression_stats(
+    csv_path=None,
+    correction="holm",
+    save=True,
+    output_dir=None,
+):
+    """Load all_subjects_bci.csv and run threshold trajectory regression tests."""
+    if csv_path is None:
+        csv_path = PROJECT_ROOT / ANALYSES_DIRNAME / "all_subjects_bci.csv"
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Consolidated BCI CSV not found: {csv_path}")
+
+    print(f"Loading: {csv_path}")
+    df = pd.read_csv(csv_path)
+    stats_results = run_bci_threshold_trajectory_regression_stats(
+        df,
+        correction=correction,
+        save=save,
+        output_dir=output_dir,
+    )
+    return {
+        "csv_path": str(csv_path),
+        "dataframe": df,
+        **stats_results,
+    }
+
+
+def compute_bci_posterior_trajectories(df, variability="sem"):
+    """Compute run-level posterior trajectories by ground-truth trial type.
+
+    ``posterior_probability`` is the online posterior probability of the
+    distractor class. This function summarizes posteriors within
+    subject/session/run/trial-type cells using the trial-level median and IQR,
+    then averages those subject-level medians and IQR bounds across subjects by
+    group.
+    """
+    required_columns = {
+        "subject_id",
+        "group",
+        "session_id",
+        "run_id",
+        "trial_id",
+        "posterior_probability",
+        "decoding_task",
+    }
+    missing_columns = sorted(required_columns - set(df.columns))
+    if missing_columns:
+        raise ValueError(
+            "Posterior trajectory analysis is missing required columns: "
+            f"{missing_columns}. Regenerate all_subjects_bci.csv with decoding "
+            "analysis columns before running this analysis."
+        )
+    if variability not in {"sem", "sd"}:
+        raise ValueError("variability must be 'sem' or 'sd'.")
+
+    data = df.copy()
+    print("=" * 80)
+    print("BCI POSTERIOR TRAJECTORY INPUT VALIDATION")
+    print("=" * 80)
+    print(f"Input trial-level rows: {len(data)}")
+
+    invalid_groups = sorted(set(data["group"].dropna()) - {"experimental", "control"})
+    if invalid_groups:
+        raise ValueError(
+            "Expected group values to be 'experimental' or 'control'. "
+            f"Found: {invalid_groups}"
+        )
+
+    data["session_id"] = pd.to_numeric(data["session_id"], errors="raise").astype(int)
+    data["run_id"] = pd.to_numeric(data["run_id"], errors="raise").astype(int)
+    data["trial_id"] = pd.to_numeric(data["trial_id"], errors="raise").astype(int)
+    data["posterior_probability"] = pd.to_numeric(
+        data["posterior_probability"], errors="coerce"
+    )
+    data["decoding_task"] = pd.to_numeric(data["decoding_task"], errors="coerce")
+
+    missing_posteriors = int(data["posterior_probability"].isna().sum())
+    missing_labels = int(data["decoding_task"].isna().sum())
+    print(f"Missing posterior_probability rows: {missing_posteriors}")
+    print(f"Missing decoding_task rows: {missing_labels}")
+
+    invalid_posteriors = data[
+        data["posterior_probability"].notna()
+        & (
+            (data["posterior_probability"] < 0)
+            | (data["posterior_probability"] > 1)
+        )
+    ]
+    if not invalid_posteriors.empty:
+        raise ValueError(
+            "posterior_probability must be between 0 and 1. "
+            f"Found {len(invalid_posteriors)} invalid rows."
+        )
+
+    if missing_labels:
+        missing_label_summary = (
+            data.loc[data["decoding_task"].isna()]
+            .groupby(["subject_id", "group", "session_id", "run_id"], observed=False)
+            .size()
+            .reset_index(name="n_missing_decoding_task_rows")
+            .sort_values(["group", "subject_id", "session_id", "run_id"])
+        )
+        print("\nRows excluded because decoding_task is missing:")
+        print(missing_label_summary.to_string(index=False))
+    else:
+        missing_label_summary = pd.DataFrame()
+
+    valid = data[
+        data["posterior_probability"].notna()
+        & data["decoding_task"].notna()
+    ].copy()
+    valid["decoding_task"] = valid["decoding_task"].astype(int)
+    invalid_labels = sorted(set(valid["decoding_task"]) - {0, 1})
+    if invalid_labels:
+        raise ValueError(
+            f"decoding_task must contain only 0/1 labels. Found: {invalid_labels}"
+        )
+
+    trial_counts_per_run = (
+        valid.groupby(["subject_id", "group", "session_id", "run_id"], observed=False)
+        .size()
+        .reset_index(name="n_labeled_trial_rows")
+    )
+    unexpected_trial_counts = trial_counts_per_run[
+        trial_counts_per_run["n_labeled_trial_rows"] != TRIALS_PER_BCI_RUN
+    ]
+    if not unexpected_trial_counts.empty:
+        print(
+            "\nRuns with labeled trial-row counts different from "
+            f"{TRIALS_PER_BCI_RUN}; retained if they have class-labeled trials:"
+        )
+        print(unexpected_trial_counts.to_string(index=False))
+    else:
+        print(f"\nLabeled trial count check: PASS ({TRIALS_PER_BCI_RUN} rows per run).")
+
+    valid["trial_type"] = np.where(
+        valid["decoding_task"] == 1,
+        "distractor_trials",
+        "no_distractor_trials",
+    )
+    valid["distractor_class_posterior"] = valid["posterior_probability"]
+    valid["no_distractor_class_posterior"] = 1.0 - valid["posterior_probability"]
+
+    def _subject_run_mean_sd(cell):
+        return pd.Series({
+            "distractor_class_mean": cell["distractor_class_posterior"].mean(),
+            "distractor_class_sd": cell["distractor_class_posterior"].std(ddof=1),
+            "no_distractor_class_mean": cell["no_distractor_class_posterior"].mean(),
+            "no_distractor_class_sd": cell["no_distractor_class_posterior"].std(ddof=1),
+            "n_trials": len(cell),
+        })
+
+    subject_run = (
+        valid.groupby(
+            ["subject_id", "group", "session_id", "run_id", "trial_type"],
+            observed=False,
+        )[
+            [
+                "distractor_class_posterior",
+                "no_distractor_class_posterior",
+            ]
+        ]
+        .apply(_subject_run_mean_sd)
+        .reset_index()
+        .sort_values(["group", "subject_id", "session_id", "run_id", "trial_type"])
+    )
+    if subject_run.empty:
+        raise ValueError("No subject/run posterior rows could be computed.")
+
+    trial_type_counts = (
+        subject_run.groupby(["group", "session_id", "run_id", "trial_type"], observed=False)
+        ["subject_id"]
+        .nunique()
+        .reset_index(name="n_subjects_with_trial_type")
+        .sort_values(["group", "session_id", "run_id", "trial_type"])
+    )
+    print("\nSubject/run posterior aggregation:")
+    print(
+        f"{len(valid)} labeled trial rows collapsed to "
+        f"{len(subject_run)} subject/run/trial-type rows."
+    )
+    print("\nSubjects contributing by group/session/run/trial type:")
+    print(trial_type_counts.head(40).to_string(index=False))
+
+    distractor_long = subject_run[
+        [
+            "subject_id",
+            "group",
+            "session_id",
+            "run_id",
+            "trial_type",
+            "n_trials",
+            "distractor_class_mean",
+            "distractor_class_sd",
+        ]
+    ].rename(
+        columns={
+            "distractor_class_mean": "subject_mean_posterior",
+            "distractor_class_sd": "subject_sd_posterior",
+        }
+    )
+    distractor_long["posterior_class"] = "distractor_class_posterior"
+
+    no_distractor_long = subject_run[
+        [
+            "subject_id",
+            "group",
+            "session_id",
+            "run_id",
+            "trial_type",
+            "n_trials",
+            "no_distractor_class_mean",
+            "no_distractor_class_sd",
+        ]
+    ].rename(
+        columns={
+            "no_distractor_class_mean": "subject_mean_posterior",
+            "no_distractor_class_sd": "subject_sd_posterior",
+        }
+    )
+    no_distractor_long["posterior_class"] = "no_distractor_class_posterior"
+
+    subject_long = pd.concat([distractor_long, no_distractor_long], ignore_index=True)
+    subject_long = subject_long[
+        [
+            "subject_id",
+            "group",
+            "session_id",
+            "run_id",
+            "trial_type",
+            "posterior_class",
+            "subject_mean_posterior",
+            "subject_sd_posterior",
+            "n_trials",
+        ]
+    ]
+
+    summary = (
+        subject_long.groupby(
+            ["group", "session_id", "run_id", "trial_type", "posterior_class"],
+            observed=False,
+        )
+        .agg(
+            mean_subject_mean_posterior=("subject_mean_posterior", "mean"),
+            sd_subject_mean_posterior=("subject_mean_posterior", "std"),
+            mean_subject_sd_posterior=("subject_sd_posterior", "mean"),
+            n_subjects=("subject_id", "nunique"),
+            mean_trials_per_subject=("n_trials", "mean"),
+        )
+        .reset_index()
+    )
+    summary["sem_subject_mean_posterior"] = (
+        summary["sd_subject_mean_posterior"] / np.sqrt(summary["n_subjects"])
+    )
+    summary["variability"] = variability
+    summary = summary.sort_values(
+        ["posterior_class", "trial_type", "group", "session_id", "run_id"]
+    ).reset_index(drop=True)
+
+    print(
+        "\nGroup/run posterior summary: line = average subject run mean; "
+        "shading = between-subject SEM of subject run means."
+    )
+    print(summary.head(32).to_string(index=False))
+
+    return {
+        "subject_run_posteriors": subject_run,
+        "subject_run_posteriors_long": subject_long,
+        "summary": summary,
+        "trial_type_counts": trial_type_counts,
+        "missing_label_summary": missing_label_summary,
+        "variability": variability,
+    }
+
+
+def plot_bci_posterior_trajectories(
+    summary,
+    posterior_class,
+    title,
+    ylabel,
+    save=True,
+    output_path=None,
+    session_gap=1.5,
+    trial_type_filter=None,
+    show_trial_type_legend=True,
+    force_solid_lines=False,
+    y_limits=None,
+):
+    """Plot posterior trajectories for one posterior class with session breaks."""
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    group_order = ["experimental", "control"]
+    colors = {
+        "experimental": "#DD8452",
+        "control": "#4C72B0",
+    }
+    group_labels = {
+        "experimental": "BCI",
+        "control": "Mental rehearsal",
+    }
+    trial_type_order = ["distractor_trials", "no_distractor_trials"]
+    trial_type_labels = {
+        "distractor_trials": "Distractor trials",
+        "no_distractor_trials": "No distractor trials",
+    }
+    linestyles = {
+        "distractor_trials": "-",
+        "no_distractor_trials": "--",
+    }
+    if force_solid_lines:
+        linestyles = {trial_type: "-" for trial_type in linestyles}
+
+    if output_path is None:
+        output_path = FIGURES_DIR / f"bci_{posterior_class}_trajectory_by_group.pdf"
+
+    plot_data = summary[summary["posterior_class"] == posterior_class].copy()
+    if trial_type_filter is not None:
+        if trial_type_filter not in trial_type_order:
+            raise ValueError(
+                f"trial_type_filter must be one of {trial_type_order}, got "
+                f"{trial_type_filter}."
+            )
+        plot_data = plot_data[plot_data["trial_type"] == trial_type_filter].copy()
+    if plot_data.empty:
+        raise ValueError(
+            f"No posterior summary rows found for {posterior_class}"
+            + (
+                f" and trial_type={trial_type_filter}."
+                if trial_type_filter is not None
+                else "."
+            )
+        )
+
+    x_positions, ticks, ticklabels, _ = _threshold_trajectory_x_positions(
+        session_gap=session_gap
+    )
+    plot_data["x"] = [
+        x_positions.get((int(row.session_id), int(row.run_id)), np.nan)
+        for row in plot_data.itertuples(index=False)
+    ]
+    plot_data = plot_data.dropna(subset=["x", "mean_subject_mean_posterior"])
+
+    plotted_values = []
+    with plt.rc_context(_publication_style_rcparams()):
+        fig, ax = plt.subplots(figsize=(7.2, 3.3))
+
+        for group in group_order:
+            for trial_type in trial_type_order:
+                line_df = plot_data[
+                    (plot_data["group"] == group)
+                    & (plot_data["trial_type"] == trial_type)
+                ].sort_values(["session_id", "run_id"])
+                if line_df.empty:
+                    continue
+
+                for _, session_df in line_df.groupby("session_id", sort=True):
+                    x = session_df["x"].to_numpy(dtype=float)
+                    y = session_df["mean_subject_mean_posterior"].to_numpy(dtype=float)
+                    sem = (
+                        session_df["sem_subject_mean_posterior"]
+                        .fillna(0.0)
+                        .to_numpy(dtype=float)
+                    )
+                    lower = y - sem
+                    upper = y + sem
+                    plotted_values.extend(lower.tolist())
+                    plotted_values.extend(upper.tolist())
+                    ax.plot(
+                        x,
+                        y,
+                        color=colors[group],
+                        linestyle=linestyles[trial_type],
+                        linewidth=1.6,
+                        zorder=3,
+                    )
+                    ax.fill_between(
+                        x,
+                        lower,
+                        upper,
+                        color=colors[group],
+                        alpha=0.14,
+                        linewidth=0,
+                        zorder=2,
+                    )
+
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(ticklabels)
+        ax.set_xlabel("Run number within session")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["bottom"].set_linewidth(0.8)
+        ax.spines["left"].set_linewidth(0.8)
+        ax.tick_params(axis="both", which="both", length=3, width=0.8)
+
+        group_handles = [
+            Line2D([0], [0], color=colors[group], lw=1.8, label=group_labels[group])
+            for group in group_order
+        ]
+        trial_handles = [
+            Line2D(
+                [0],
+                [0],
+                color="#333333",
+                lw=1.8,
+                linestyle=linestyles[trial_type],
+                label=trial_type_labels[trial_type],
+            )
+            for trial_type in trial_type_order
+        ]
+        legend1 = ax.legend(
+            handles=group_handles,
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5 if not show_trial_type_legend else 0.66),
+            title="Group",
+            handlelength=2.4,
+        )
+        if show_trial_type_legend:
+            ax.add_artist(legend1)
+            ax.legend(
+                handles=trial_handles,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.28),
+                title="Trial type",
+                handlelength=2.4,
+            )
+
+        if y_limits is not None:
+            ax.set_ylim(*y_limits)
+        else:
+            _set_axis_padding(
+                ax,
+                plotted_values,
+                pad_fraction=0.12,
+                min_pad=0.02,
+                lower_bound=0.0,
+                upper_bound=1.0,
+            )
+        fig.tight_layout(rect=[0, 0, 0.78, 0.96])
+
+        saved_path = _save_figure_pdf_to_path(fig, output_path) if save else None
+
+    return fig, saved_path
+
+
+def load_and_plot_bci_posterior_trajectories(
+    csv_path=None,
+    variability="sem",
+    save=True,
+    distractor_output_path=None,
+    no_distractor_output_path=None,
+):
+    """Load all_subjects_bci.csv and plot posterior trajectories over runs."""
+    if csv_path is None:
+        csv_path = PROJECT_ROOT / ANALYSES_DIRNAME / "all_subjects_bci.csv"
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Consolidated BCI CSV not found: {csv_path}")
+
+    print("=" * 80)
+    print("BCI POSTERIOR TRAJECTORIES ACROSS RUNS")
+    print("=" * 80)
+    print(f"Loading: {csv_path}")
+    df = pd.read_csv(csv_path)
+
+    posterior_results = compute_bci_posterior_trajectories(df, variability=variability)
+
+    if distractor_output_path is None:
+        distractor_output_path = (
+            FIGURES_DIR / "posterior_trajectory_distractor_trials_by_group.pdf"
+        )
+    if no_distractor_output_path is None:
+        no_distractor_output_path = (
+            FIGURES_DIR / "posterior_trajectory_no_distractor_trials_by_group.pdf"
+        )
+
+    distractor_fig, distractor_figure_path = plot_bci_posterior_trajectories(
+        posterior_results["summary"],
+        posterior_class="distractor_class_posterior",
+        title=f"Distractor-trial posterior across runs ({variability.upper()})",
+        ylabel="Posterior probability",
+        save=save,
+        output_path=distractor_output_path,
+        trial_type_filter="distractor_trials",
+        show_trial_type_legend=False,
+        force_solid_lines=True,
+        y_limits=(0.4, 0.7),
+    )
+    no_distractor_fig, no_distractor_figure_path = plot_bci_posterior_trajectories(
+        posterior_results["summary"],
+        posterior_class="no_distractor_class_posterior",
+        title=f"No-distractor-trial posterior (1 - P(class 1)) across runs ({variability.upper()})",
+        ylabel="1 - P(class 1)",
+        save=save,
+        output_path=no_distractor_output_path,
+        trial_type_filter="no_distractor_trials",
+        show_trial_type_legend=False,
+        force_solid_lines=True,
+        y_limits=(0.4, 0.7),
+    )
+
+    return {
+        "csv_path": str(csv_path),
+        "dataframe": df,
+        **posterior_results,
+        "distractor_figure": distractor_fig,
+        "distractor_figure_path": (
+            str(distractor_figure_path) if distractor_figure_path is not None else None
+        ),
+        "no_distractor_figure": no_distractor_fig,
+        "no_distractor_figure_path": (
+            str(no_distractor_figure_path)
+            if no_distractor_figure_path is not None
+            else None
+        ),
     }
 
 
