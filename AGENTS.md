@@ -95,6 +95,9 @@ Common expected figure types:
 
 Use the following files depending on the task:
 
+- `data_locations.md`
+  - canonical locations for precomputed analysis files, source data, repository outputs, and the required lookup order before recomputing an analysis
+
 - `experiment_structure.md`
   - overall experiment design: sessions, tasks, runs, and trial counts
 
@@ -110,11 +113,17 @@ Use the following files depending on the task:
 - `decoder_mat.md`
   - decoder `.mat` structure, classifier interpretation, saved transforms, and performance fields
 
+- `decoder_training.md`
+  - original decoder construction: binary class definitions, xDAWN/r2 pipeline, within-run balancing, leave-one-run-out validation, iterative pruning, LDA regularization, posterior calibration, and requirements for new post-hoc decoder training
+
 - `eeg_preprocessing.md`
   - preprocessing pipeline, feature extraction, data shapes, and decoder-matched transformations
 
 - `plotting.md`
-  - plotting guide for figures
+  - required Nature Neuroscience-style and project-specific EEG figure guide; read before creating or revising any figure
+
+- `analyses.md`
+  - retention policy and contents of repository-local expensive analysis artifacts; consult before saving, moving, or deleting `analyses/` outputs
 
 ## Critical analysis rules
 
@@ -123,6 +132,7 @@ Use the following files depending on the task:
 - Do not confuse **decoder feature conventions** with **ERP plotting conventions**.
 - For decoder-matched processing, use values stored in decoder files rather than re-deriving them.
 - Do not recompute xDAWN filters, normalization, or feature selection for decoding-session inference; use the saved transforms from the decoder.
+- For any new decoder construction or a reproduction of model selection, read `decoder_training.md`; do not infer balancing, pruning, classifier calibration, or AUPRC details from saved decoder fields alone.
 - Treat `baseline_idx` and `resample.time` as relative to epoch indexing with time 0 at `epochOnset`.
 - Keep trial alignment explicit across all preprocessing and feature-extraction steps.
 - **Always validate file integrity**: Use comprehensive validation for all loaded files to ensure data quality and catch issues early.

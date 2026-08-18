@@ -1,5 +1,10 @@
 # Analysis Output Files
 
+This file describes how outputs are computed. Retain files in the
+repository-local `analyses/` directory only when they satisfy the policy in
+`doc/analyses.md`; ordinary notebook-derived summary tables should be
+regenerated rather than stored there.
+
 ## When to use this file
 Use this file when:
 - locating generated CSV files in the `analyses` folder

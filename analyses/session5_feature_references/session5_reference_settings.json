@@ -1,0 +1,20 @@
+{
+  "analysis": "session5_frozen_top30_feature_references",
+  "source": "Session 5 training task, four non-practice runs",
+  "decoder_models": {
+    "right": "right distractor versus no distractor",
+    "left": "left distractor versus no distractor"
+  },
+  "channel_construction": "seven conventional P/PO right-minus-left pairs",
+  "feature_window_s": [
+    0.2,
+    "last_available_sample"
+  ],
+  "resample_ratio": 8,
+  "xdawn_components": 2,
+  "feature_ranking": "binary r2 after final clean-trial xDAWN and z-scoring",
+  "selection": "run-wise balancing, leave-one-run-out iterative pruning, best CV AUPRC iteration",
+  "n_selected_features_per_decoder": 30,
+  "frozen_transform_artifacts": "transforms/{subject_id}_{decoder_side}_frozen_reference.npz",
+  "evaluation_rule": "apply the saved Session-5 xDAWN filters, resampling, z-score parameters, and selected indices unchanged; do not refit them on an evaluation dataset"
+}

@@ -13,6 +13,7 @@ Do NOT use this file for:
 - understanding overall experiment/session design (see `experiment_structure.md`)
 - interpreting trigger codes or event timing (see `triggers.md`)
 - parsing non-decoder task files such as `.analysis.txt`, `.triggers.txt`, or `.behoutput.txt` (see `file_contents.md`)
+- reconstructing original training, cross-validation, pruning, or posterior calibration (see `decoder_training.md`)
 
 ---
 
@@ -128,6 +129,10 @@ The `classify` sub-struct contains the classifier pipeline and should be treated
 - normalization should **not** be recomputed from new data
 - `classify.keepIdx` is applied before classification
 - `applyPCA` can be ignored in this project
+
+The saved fields describe inference from an already-trained model. For original
+training—including the verified `Gamma = 0.05` LDA setting, custom posterior
+sigmoid, balancing, and pruning—see `decoder_training.md`.
 
 ---
 

@@ -42,6 +42,34 @@ REQUIRED_RUN_COLUMNS = [
     "rt",
 ]
 
+
+def _save_figure_with_png(fig, output_path):
+    """Save a figure to the requested path and a PDF/PNG companion."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_format = output_path.suffix.lstrip(".") or "pdf"
+    primary_kwargs = {"dpi": 300} if output_format == "png" else {}
+    fig.savefig(
+        output_path,
+        format=output_format,
+        bbox_inches="tight",
+        **primary_kwargs,
+    )
+    print(f"Saved figure: {output_path}")
+
+    companion_suffix = ".png" if output_path.suffix.lower() == ".pdf" else ".pdf"
+    companion_path = output_path.with_suffix(companion_suffix)
+    companion_format = companion_suffix.lstrip(".")
+    companion_kwargs = {"dpi": 300} if companion_format == "png" else {}
+    fig.savefig(
+        companion_path,
+        format=companion_format,
+        bbox_inches="tight",
+        **companion_kwargs,
+    )
+    print(f"Saved figure: {companion_path}")
+    return output_path
+
 NONMISSING_TASK_COLUMNS = [
     "block_type",
     "chose_best",
@@ -856,7 +884,7 @@ def plot_color_shape_overall_accuracy_histogram(
     unique = dict(zip(labels, handles))
     ax.legend(unique.values(), unique.keys(), frameon=False)
     fig.tight_layout()
-    fig.savefig(output_path, format="pdf", bbox_inches="tight")
+    _save_figure_with_png(fig, output_path)
 
     print(f"Saved Color/Shape overall accuracy QC histogram: {output_path}")
     return fig, ax, output_path
@@ -1021,7 +1049,7 @@ def plot_color_shape_reaction_time_qc_histogram(
     unique = dict(zip(labels, handles))
     ax.legend(unique.values(), unique.keys(), frameon=False)
     fig.tight_layout()
-    fig.savefig(output_path, format="pdf", bbox_inches="tight")
+    _save_figure_with_png(fig, output_path)
 
     print(f"Saved Color/Shape RT QC histogram: {output_path}")
     return fig, ax, output_path
@@ -2333,7 +2361,7 @@ def plot_color_shape_prepost_accuracy_rt_by_group(
     axes[0, 1].legend(frameon=False, loc="best")
     fig.suptitle("Pre/post averages by group", y=0.995, fontsize=11)
     fig.tight_layout()
-    fig.savefig(output_path, format="pdf", bbox_inches="tight")
+    _save_figure_with_png(fig, output_path)
     print(f"Saved Color/Shape #20 pre/post figure: {output_path}")
     return fig, axes, output_path
 

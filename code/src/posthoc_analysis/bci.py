@@ -1236,6 +1236,9 @@ def _save_figure_pdf(fig, filename_stem):
     output_path = FIGURES_DIR / f"{filename_stem}.pdf"
     fig.savefig(output_path, format="pdf", bbox_inches="tight")
     print(f"Saved figure: {output_path}")
+    png_path = output_path.with_suffix(".png")
+    fig.savefig(png_path, format="png", dpi=300, bbox_inches="tight")
+    print(f"Saved figure: {png_path}")
     return output_path
 
 
@@ -2961,8 +2964,20 @@ def compute_bci_threshold_change_session1_to_session5(df):
 def _save_figure_pdf_to_path(fig, output_path):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, format="pdf", bbox_inches="tight")
+    output_format = output_path.suffix.lstrip(".") or "pdf"
+    fig.savefig(output_path, format=output_format, bbox_inches="tight")
     print(f"Saved figure: {output_path}")
+    companion_suffix = ".png" if output_path.suffix.lower() == ".pdf" else ".pdf"
+    companion_path = output_path.with_suffix(companion_suffix)
+    companion_format = companion_suffix.lstrip(".")
+    companion_kwargs = {"dpi": 300} if companion_format == "png" else {}
+    fig.savefig(
+        companion_path,
+        format=companion_format,
+        bbox_inches="tight",
+        **companion_kwargs,
+    )
+    print(f"Saved figure: {companion_path}")
     return output_path
 
 
@@ -3908,6 +3923,100 @@ def _holm_bonferroni(p_values):
     return adjusted
 
 
+def run_bci_threshold_full_sequence_group_slope_comparisons(
+    subject_slopes,
+    correction="holm",
+):
+    """Directly compare BCI and control full-training threshold slopes.
+
+    Each participant contributes one ordinary-least-squares slope across the
+    36-run training sequence for each threshold class. The independent BCI vs
+    control difference in these participant-level slopes is tested with a
+    two-sided Welch t-test. The distractor and no-distractor comparisons form
+    one prespecified family and are Holm-corrected together.
+    """
+    from scipy import stats
+
+    required_columns = {"subject_id", "group", "threshold_type", "slope_per_run"}
+    missing_columns = sorted(required_columns - set(subject_slopes.columns))
+    if missing_columns:
+        raise ValueError(
+            "Subject-slope table is missing required columns: "
+            f"{missing_columns}"
+        )
+    if correction != "holm":
+        raise ValueError("Only correction='holm' is currently supported.")
+
+    data = subject_slopes[list(required_columns)].copy()
+    data["slope_per_run"] = pd.to_numeric(data["slope_per_run"], errors="coerce")
+    if data["slope_per_run"].isna().any():
+        raise ValueError("Subject-slope table contains missing or non-numeric slopes.")
+    expected_groups = {"experimental", "control"}
+    observed_groups = set(data["group"])
+    if observed_groups != expected_groups:
+        raise ValueError(f"Expected groups {sorted(expected_groups)}, found {sorted(observed_groups)}.")
+    expected_thresholds = {"distractor", "no_distractor"}
+    observed_thresholds = set(data["threshold_type"])
+    if observed_thresholds != expected_thresholds:
+        raise ValueError(
+            "Direct group slope comparison expects the combined threshold classes "
+            f"{sorted(expected_thresholds)}, found {sorted(observed_thresholds)}."
+        )
+    duplicate_cells = data.groupby(["subject_id", "threshold_type"], observed=False).size()
+    if not (duplicate_cells == 1).all():
+        raise ValueError("Expected exactly one full-sequence slope per subject and threshold class.")
+
+    rows = []
+    for threshold_type in ("distractor", "no_distractor"):
+        cell = data[data["threshold_type"] == threshold_type]
+        bci = cell.loc[cell["group"] == "experimental", "slope_per_run"].to_numpy(dtype=float)
+        control = cell.loc[cell["group"] == "control", "slope_per_run"].to_numpy(dtype=float)
+        if len(bci) < 2 or len(control) < 2:
+            raise ValueError(
+                f"Need at least two slopes per group for {threshold_type}; "
+                f"found BCI={len(bci)}, control={len(control)}."
+            )
+        mean_bci, mean_control = float(np.mean(bci)), float(np.mean(control))
+        sd_bci, sd_control = float(np.std(bci, ddof=1)), float(np.std(control, ddof=1))
+        difference = mean_bci - mean_control
+        se = float(np.sqrt(sd_bci ** 2 / len(bci) + sd_control ** 2 / len(control)))
+        welch_df = float((sd_bci ** 2 / len(bci) + sd_control ** 2 / len(control)) ** 2 / (
+            (sd_bci ** 2 / len(bci)) ** 2 / (len(bci) - 1)
+            + (sd_control ** 2 / len(control)) ** 2 / (len(control) - 1)
+        ))
+        t_stat = difference / se
+        p_value = float(2 * stats.t.sf(abs(t_stat), welch_df))
+        critical_t = float(stats.t.ppf(0.975, welch_df))
+        pooled_sd = float(np.sqrt(
+            ((len(bci) - 1) * sd_bci ** 2 + (len(control) - 1) * sd_control ** 2)
+            / (len(bci) + len(control) - 2)
+        ))
+        cohen_d = difference / pooled_sd if pooled_sd > 0 else np.nan
+        hedges_correction = 1 - 3 / (4 * (len(bci) + len(control) - 2) - 1)
+        rows.append({
+            "threshold_type": threshold_type,
+            "contrast": "BCI - mental rehearsal",
+            "n_bci": int(len(bci)), "n_control": int(len(control)),
+            "mean_slope_bci_per_run": mean_bci,
+            "sd_slope_bci_per_run": sd_bci,
+            "mean_slope_control_per_run": mean_control,
+            "sd_slope_control_per_run": sd_control,
+            "slope_difference_bci_minus_control_per_run": difference,
+            "ci95_low_difference_per_run": difference - critical_t * se,
+            "ci95_high_difference_per_run": difference + critical_t * se,
+            "welch_t": float(t_stat), "welch_df": welch_df, "p_two_sided": p_value,
+            "cohens_d": cohen_d, "hedges_g": cohen_d * hedges_correction if np.isfinite(cohen_d) else np.nan,
+        })
+    comparisons = pd.DataFrame(rows)
+    comparisons["p_holm_two_comparison_family"] = _holm_bonferroni(comparisons["p_two_sided"])
+    comparisons["significant_holm_0_05"] = comparisons["p_holm_two_comparison_family"] < 0.05
+    print("\nDirect BCI vs mental-rehearsal full-sequence slope comparisons:")
+    print("  Contrast: BCI slope - mental-rehearsal slope; two-sided Welch tests.")
+    print("  Holm correction is across distractor and no-distractor slope comparisons.")
+    print(comparisons.to_string(index=False))
+    return comparisons
+
+
 def run_bci_threshold_trajectory_regression_stats(
     df,
     correction="holm",
@@ -4026,6 +4135,11 @@ def run_bci_threshold_trajectory_regression_stats(
         overall_tests["p_holm_overall_family"] < 0.05
     )
 
+    group_slope_comparisons = run_bci_threshold_full_sequence_group_slope_comparisons(
+        subject_slopes,
+        correction=correction,
+    )
+
     session_slope_rows = []
     for (subject_id, group, session_id, threshold_type), cell in subject_run.groupby(
         ["subject_id", "group", "session_id", "threshold_type"], observed=False
@@ -4122,11 +4236,13 @@ def run_bci_threshold_trajectory_regression_stats(
         output_paths = {
             "subject_slopes": output_dir / "bci_threshold_subject_full_sequence_slopes.csv",
             "overall_tests": output_dir / "bci_threshold_overall_slope_tests.csv",
+            "group_slope_comparisons": output_dir / "bci_threshold_group_slope_comparisons.csv",
             "session_slopes": output_dir / "bci_threshold_subject_session_slopes.csv",
             "session_tests": output_dir / "bci_threshold_session_slope_tests.csv",
         }
         subject_slopes.to_csv(output_paths["subject_slopes"], index=False)
         overall_tests.to_csv(output_paths["overall_tests"], index=False)
+        group_slope_comparisons.to_csv(output_paths["group_slope_comparisons"], index=False)
         session_slopes.to_csv(output_paths["session_slopes"], index=False)
         session_tests.to_csv(output_paths["session_tests"], index=False)
         print("\nSaved threshold statistics tables:")
@@ -4138,6 +4254,7 @@ def run_bci_threshold_trajectory_regression_stats(
         "subject_run_thresholds_with_global_index": subject_run,
         "subject_slopes": subject_slopes,
         "overall_tests": overall_tests,
+        "group_slope_comparisons": group_slope_comparisons,
         "session_slopes": session_slopes,
         "session_tests": session_tests,
         "correction": correction,
@@ -4699,7 +4816,7 @@ def run_bci_combined_threshold_change_mixed_anova(combined_subject_threshold_cha
     expected_threshold_types = ["distractor", "no_distractor"]
     if groups != expected_groups:
         raise ValueError(f"Expected groups {expected_groups}, found {groups}.")
-    if threshold_types != expected_threshold_types:
+    if set(threshold_types) != set(expected_threshold_types):
         raise ValueError(
             f"Expected threshold types {expected_threshold_types}, found {threshold_types}."
         )
@@ -4873,6 +4990,320 @@ def run_bci_combined_threshold_change_mixed_anova(combined_subject_threshold_cha
         "cell_summary": cell_summary,
         "diagnostics": diagnostics,
         "input_data": data,
+    }
+
+
+def run_bci_separated_threshold_change_mixed_anova(subject_threshold_change):
+    """Run Group x Threshold Type mixed ANOVA on separated threshold-change scores.
+
+    Dependent variable: Session 5 - Session 1 threshold change.
+    Between-subject factor: group (`experimental` vs `control`).
+    Within-subject factor: threshold_type (`thrR`, `thrL`, `thrN`).
+    The no-distractor threshold (`thrN`) is expected to have already been
+    transformed as ``1 - thrN`` by ``compute_bci_threshold_change_session1_to_session5``.
+    """
+    from scipy import stats
+
+    required_columns = {"subject_id", "group", "threshold_type", "delta"}
+    missing_columns = sorted(required_columns - set(subject_threshold_change.columns))
+    if missing_columns:
+        raise ValueError(
+            "Separated threshold mixed ANOVA requires columns: "
+            f"{missing_columns}"
+        )
+
+    data = subject_threshold_change[list(required_columns)].copy()
+    data = data.dropna(subset=["subject_id", "group", "threshold_type", "delta"])
+    data["threshold_type"] = data["threshold_type"].astype(str)
+
+    print("=" * 80)
+    print("BCI SEPARATED THRESHOLD CHANGE MIXED-DESIGN ANOVA")
+    print("=" * 80)
+    print("Design: Group (between: BCI vs mental rehearsal) x Threshold type")
+    print("Within-subject threshold levels: thrR, thrL, transformed thrN")
+    print("Dependent variable: Session 5 - Session 1 threshold change")
+
+    expected_groups = ["control", "experimental"]
+    expected_threshold_types = ["thrR", "thrL", "thrN"]
+    groups = sorted(data["group"].unique().tolist())
+    threshold_types = sorted(data["threshold_type"].unique().tolist())
+    if groups != expected_groups:
+        raise ValueError(f"Expected groups {expected_groups}, found {groups}.")
+    if set(threshold_types) != set(expected_threshold_types):
+        raise ValueError(
+            f"Expected threshold types {expected_threshold_types}, found {threshold_types}."
+        )
+
+    duplicate_cells = (
+        data.groupby(["subject_id", "threshold_type"], observed=False)
+        .size()
+        .reset_index(name="n_rows")
+    )
+    duplicate_cells = duplicate_cells[duplicate_cells["n_rows"] != 1]
+    if not duplicate_cells.empty:
+        raise ValueError(
+            "Expected exactly one delta row per subject/threshold type. Problem cells:\n"
+            f"{duplicate_cells.to_string(index=False)}"
+        )
+
+    counts = (
+        data.groupby(["subject_id", "group"], observed=False)["threshold_type"]
+        .nunique()
+        .reset_index(name="n_threshold_types")
+    )
+    incomplete = counts[counts["n_threshold_types"] != len(expected_threshold_types)]
+    if not incomplete.empty:
+        raise ValueError(
+            "Mixed ANOVA requires complete thrR/thrL/thrN deltas for each subject. "
+            f"Incomplete subjects:\n{incomplete.to_string(index=False)}"
+        )
+
+    subjects_by_group = (
+        data[["subject_id", "group"]]
+        .drop_duplicates()
+        .groupby("group", observed=False)
+        .size()
+        .to_dict()
+    )
+    if len(set(subjects_by_group.values())) != 1:
+        raise ValueError(
+            "This ANOVA helper expects a balanced group design. "
+            f"Subject counts by group: {subjects_by_group}"
+        )
+
+    data["threshold_type"] = pd.Categorical(
+        data["threshold_type"],
+        categories=expected_threshold_types,
+        ordered=True,
+    )
+    print(f"Subjects by group: {subjects_by_group}")
+    print(f"Threshold types: {expected_threshold_types}")
+
+    grand_mean = data["delta"].mean()
+    group_means = data.groupby("group", observed=False)["delta"].mean()
+    threshold_means = data.groupby("threshold_type", observed=False)["delta"].mean()
+    group_threshold_means = (
+        data.groupby(["group", "threshold_type"], observed=False)["delta"].mean()
+    )
+    subject_means = (
+        data.groupby(["group", "subject_id"], observed=False)["delta"].mean()
+    )
+
+    n_thresholds = len(expected_threshold_types)
+    n_total_subjects = data["subject_id"].nunique()
+    n_by_group = (
+        data[["subject_id", "group"]]
+        .drop_duplicates()
+        .groupby("group", observed=False)
+        .size()
+    )
+
+    ss_group = n_thresholds * sum(
+        n_by_group[group] * (group_means[group] - grand_mean) ** 2
+        for group in expected_groups
+    )
+    ss_subject_group = n_thresholds * sum(
+        (subject_means[(group, subject_id)] - group_means[group]) ** 2
+        for group in expected_groups
+        for subject_id in data.loc[data["group"] == group, "subject_id"].unique()
+    )
+    ss_threshold = n_total_subjects * sum(
+        (threshold_means[threshold_type] - grand_mean) ** 2
+        for threshold_type in expected_threshold_types
+    )
+    ss_group_threshold = sum(
+        n_by_group[group] * (
+            group_threshold_means[(group, threshold_type)]
+            - group_means[group]
+            - threshold_means[threshold_type]
+            + grand_mean
+        ) ** 2
+        for group in expected_groups
+        for threshold_type in expected_threshold_types
+    )
+    ss_error = 0.0
+    for row in data.itertuples(index=False):
+        subject_mean = subject_means[(row.group, row.subject_id)]
+        group_threshold_mean = group_threshold_means[(row.group, row.threshold_type)]
+        group_mean = group_means[row.group]
+        ss_error += (
+            row.delta - subject_mean - group_threshold_mean + group_mean
+        ) ** 2
+
+    df_group = len(expected_groups) - 1
+    df_subject_group = n_total_subjects - len(expected_groups)
+    df_threshold = len(expected_threshold_types) - 1
+    df_group_threshold = df_group * df_threshold
+    df_error = df_subject_group * df_threshold
+
+    ms_group = ss_group / df_group
+    ms_subject_group = ss_subject_group / df_subject_group
+    ms_threshold = ss_threshold / df_threshold
+    ms_group_threshold = ss_group_threshold / df_group_threshold
+    ms_error = ss_error / df_error
+
+    f_group = ms_group / ms_subject_group
+    f_threshold = ms_threshold / ms_error
+    f_group_threshold = ms_group_threshold / ms_error
+
+    wide = (
+        data.pivot_table(
+            index=["subject_id", "group"],
+            columns="threshold_type",
+            values="delta",
+            aggfunc="first",
+            observed=False,
+        )
+        .reindex(columns=expected_threshold_types)
+        .reset_index()
+    )
+    threshold_matrix = wide[expected_threshold_types].to_numpy(dtype=float)
+    centered = threshold_matrix - threshold_matrix.mean(axis=1, keepdims=True)
+    covariance = np.cov(centered, rowvar=False, ddof=1)
+    centering = np.eye(n_thresholds) - np.ones((n_thresholds, n_thresholds)) / n_thresholds
+    sph_matrix = centering @ covariance @ centering
+    eigenvalues = np.linalg.eigvalsh(sph_matrix)
+    positive_eigenvalues = eigenvalues[eigenvalues > np.finfo(float).eps * 100]
+    if len(positive_eigenvalues) == df_threshold:
+        epsilon_gg = (
+            positive_eigenvalues.sum() ** 2
+            / (df_threshold * np.square(positive_eigenvalues).sum())
+        )
+        epsilon_gg = float(np.clip(epsilon_gg, 1 / df_threshold, 1.0))
+        mauchly_w = float(
+            np.prod(positive_eigenvalues)
+            / ((positive_eigenvalues.mean()) ** df_threshold)
+        )
+        mauchly_w = float(np.clip(mauchly_w, np.finfo(float).tiny, 1.0))
+        correction_factor = (
+            (2 * df_threshold**2 + df_threshold + 2)
+            / (6 * df_threshold * (n_total_subjects - 1))
+        )
+        mauchly_chi_square = float(
+            -(n_total_subjects - 1) * (1 - correction_factor) * np.log(mauchly_w)
+        )
+        mauchly_df = int((df_threshold * (df_threshold + 1) / 2) - 1)
+        mauchly_p = float(stats.chi2.sf(mauchly_chi_square, mauchly_df))
+    else:
+        epsilon_gg = np.nan
+        mauchly_w = np.nan
+        mauchly_chi_square = np.nan
+        mauchly_df = np.nan
+        mauchly_p = np.nan
+
+    def _gg_p_value(f_value):
+        if pd.isna(epsilon_gg):
+            return np.nan
+        return stats.f.sf(
+            f_value,
+            epsilon_gg * df_threshold,
+            epsilon_gg * df_error,
+        )
+
+    rows = [
+        {
+            "effect": "Group",
+            "ss": ss_group,
+            "df": df_group,
+            "ms": ms_group,
+            "error_term": "Subject(Group)",
+            "error_df": df_subject_group,
+            "F": f_group,
+            "p_value": stats.f.sf(f_group, df_group, df_subject_group),
+            "p_value_gg": np.nan,
+            "gg_epsilon": np.nan,
+            "partial_eta_sq": ss_group / (ss_group + ss_subject_group),
+        },
+        {
+            "effect": "Threshold type",
+            "ss": ss_threshold,
+            "df": df_threshold,
+            "ms": ms_threshold,
+            "error_term": "Threshold type x Subject(Group)",
+            "error_df": df_error,
+            "F": f_threshold,
+            "p_value": stats.f.sf(f_threshold, df_threshold, df_error),
+            "p_value_gg": _gg_p_value(f_threshold),
+            "gg_epsilon": epsilon_gg,
+            "partial_eta_sq": ss_threshold / (ss_threshold + ss_error),
+        },
+        {
+            "effect": "Group x Threshold type",
+            "ss": ss_group_threshold,
+            "df": df_group_threshold,
+            "ms": ms_group_threshold,
+            "error_term": "Threshold type x Subject(Group)",
+            "error_df": df_error,
+            "F": f_group_threshold,
+            "p_value": stats.f.sf(f_group_threshold, df_group_threshold, df_error),
+            "p_value_gg": _gg_p_value(f_group_threshold),
+            "gg_epsilon": epsilon_gg,
+            "partial_eta_sq": ss_group_threshold / (ss_group_threshold + ss_error),
+        },
+    ]
+    anova_table = pd.DataFrame(rows)
+
+    cell_summary = (
+        data.groupby(["group", "threshold_type"], observed=False)["delta"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+        .rename(columns={"mean": "mean_delta", "std": "sd_delta", "count": "n_subjects"})
+    )
+    cell_summary["SEM"] = cell_summary["sd_delta"] / np.sqrt(cell_summary["n_subjects"])
+
+    sphericity = {
+        "mauchly_w": mauchly_w,
+        "mauchly_chi_square": mauchly_chi_square,
+        "mauchly_df": mauchly_df,
+        "mauchly_p_value": mauchly_p,
+        "greenhouse_geisser_epsilon": epsilon_gg,
+    }
+    diagnostics = {
+        "grand_mean_delta": float(grand_mean),
+        "subjects_by_group": subjects_by_group,
+        "n_subjects": int(n_total_subjects),
+        "threshold_types": expected_threshold_types,
+        "ss_subject_group": float(ss_subject_group),
+        "df_subject_group": int(df_subject_group),
+        "ss_error": float(ss_error),
+        "df_error": int(df_error),
+        "sphericity": sphericity,
+    }
+
+    print("\nCell summary:")
+    print(cell_summary.to_string(index=False))
+    print("\nSphericity diagnostics:")
+    print(pd.DataFrame([sphericity]).to_string(index=False))
+    print("\nMixed-design ANOVA table:")
+    print(anova_table.to_string(index=False))
+
+    return {
+        "anova_table": anova_table,
+        "cell_summary": cell_summary,
+        "diagnostics": diagnostics,
+        "sphericity": sphericity,
+        "input_data": data,
+        "wide_data": wide,
+    }
+
+
+def load_and_run_bci_separated_threshold_change_mixed_anova(csv_path=None):
+    """Load BCI CSV, compute separated threshold changes, and run mixed ANOVA."""
+    threshold_results = load_and_plot_bci_threshold_change_session1_to_session5(
+        csv_path=csv_path,
+        save=False,
+    )
+    anova_results = run_bci_separated_threshold_change_mixed_anova(
+        threshold_results["subject_threshold_change"]
+    )
+    return {
+        **threshold_results,
+        "anova_table": anova_results["anova_table"],
+        "anova_cell_summary": anova_results["cell_summary"],
+        "anova_diagnostics": anova_results["diagnostics"],
+        "anova_sphericity": anova_results["sphericity"],
+        "anova_input_data": anova_results["input_data"],
+        "anova_wide_data": anova_results["wide_data"],
     }
 
 

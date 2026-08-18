@@ -388,20 +388,12 @@ Do not retrain or refit the classifier during decoding.
 
 Iterative pruning is part of decoder training.
 
-At a high level:
-- training data are repeatedly pruned across iterations based on posterior probabilities
-- balancing across runs is applied to ensure equal number of trials between classes
-- leave-one-file-out cross-validation is used during evaluation
-- performance is tracked across iterations
-- the best iteration is selected using AUPRC
-- retained trials from the best iteration are used to define the final decoder/training summary
-
-The saved decoder files preserve pruning outcomes through:
-- `performance`
-- `performance.history`
-- `performance.nTrials`
-
-However, the **exact pruning logic** is not fully recoverable from decoder files alone.
+Iterative pruning, run-wise balancing, leave-one-run-out cross-validation, and
+the exact posterior-based removal rules are documented in
+`decoder_training.md`. Read that file before rebuilding a decoder. The saved
+decoder files preserve outcomes through `performance`, `performance.history`,
+and `performance.nTrials`, but do not by themselves specify the full training
+procedure.
 
 ---
 

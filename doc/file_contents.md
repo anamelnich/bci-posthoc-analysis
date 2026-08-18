@@ -96,7 +96,9 @@ Each `.gdf` file contains:
 
 ### Notes
 - Same trigger information is also present in `.gdf` Status channel
-- Timing values are in **samples (not milliseconds)**
+- Timing values are in **samples (not milliseconds)**. The trigger-text time
+  clock may differ from the GDF Status clock; use Status-event samples for EEG
+  epoching after verifying condition/order alignment.
 
 ---
 
@@ -185,7 +187,9 @@ Each `.gdf` file contains:
 
 ## 7. Units and Timing
 
-- Trigger timing values are in **samples**, not milliseconds.
+- Trigger timing values are in **samples**, not milliseconds. Use GDF Status
+  event samples for EEG timing; trigger-text timestamps may use a different
+  sampling clock.
 - Behavioral reaction times (e.g., in Stroop files) are in **milliseconds**.
-- To convert samples to time:
+- To convert GDF Status samples to time:
   - `time (seconds) = samples / fsamp`

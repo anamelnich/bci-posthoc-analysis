@@ -3921,9 +3921,12 @@ def set_publication_style():
 
 
 def _save_figure_pdf(fig, filename_stem):
-    """Save a figure as PDF in the repository figures directory."""
+    """Save a figure as PDF and PNG in the repository figures directory."""
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     output_path = FIGURES_DIR / f"{filename_stem}.pdf"
     fig.savefig(output_path, format="pdf", bbox_inches="tight")
     print(f"Saved figure: {output_path}")
+    png_path = output_path.with_suffix(".png")
+    fig.savefig(png_path, format="png", dpi=300, bbox_inches="tight")
+    print(f"Saved figure: {png_path}")
     return output_path

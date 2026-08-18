@@ -18,8 +18,11 @@ Do NOT use this file for:
 - Triggers are stored in:
   - `.triggers.txt` files
   - EEG `.gdf` files in the **Status channel (channel 67)**
-- Timing values are in **samples**, not milliseconds
-- To convert to time:  
+- Timing values are in **samples**, not milliseconds. The trigger-text clock
+  can differ from the 512 Hz GDF Status clock (in Session 5 validation it was
+  approximately 1000 Hz versus 512 Hz). Use GDF Status samples—not
+  trigger-text times—to slice EEG epochs.
+- To convert a GDF Status sample to time:
   `time (seconds) = samples / fsamp`
 
 ---

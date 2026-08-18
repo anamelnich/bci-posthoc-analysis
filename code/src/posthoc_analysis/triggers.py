@@ -19,13 +19,16 @@ STIMULUS_CODES = {
 TRAINING_COLUMNS = ["trial", "trigger", "time"]
 
 
-def load_training_trigger_file(filepath):
+def load_training_trigger_file(filepath, allow_zero_latency_response=False):
     """Load and validate a training trigger text file.
 
     Parameters
     ----------
     filepath : str or Path
         Path to a `triggers.txt` file for a training or decoding run.
+    allow_zero_latency_response : bool
+        Permit a response timestamp equal to its stimulus timestamp. This is
+        appropriate only when reaction time is not an analysis input.
 
     Returns
     -------
@@ -44,11 +47,15 @@ def load_training_trigger_file(filepath):
         dtype={"trial": int, "trigger": int, "time": int},
     )
 
-    validate_training_triggers(df, filepath)
+    validate_training_triggers(
+        df,
+        filepath,
+        allow_zero_latency_response=allow_zero_latency_response,
+    )
     return df
 
 
-def validate_training_triggers(df, filepath=None):
+def validate_training_triggers(df, filepath=None, allow_zero_latency_response=False):
     """Validate that a training trigger DataFrame matches expected structure."""
     if df.shape[0] != TRAINING_TRIGGER_COUNT:
         raise ValueError(
@@ -100,7 +107,11 @@ def validate_training_triggers(df, filepath=None):
                 f"Trial {trial} expected response trigger {RESPONSE_CODE} third, got {triggers[2]}.")
 
         times = group["time"].tolist()
-        if not (times[0] < times[1] < times[2]):
+        valid_time_order = times[0] < times[1] < times[2]
+        tolerated_zero_latency_response = (
+            allow_zero_latency_response and times[0] < times[1] == times[2]
+        )
+        if not (valid_time_order or tolerated_zero_latency_response):
             raise ValueError(
                 f"Trial {trial} trigger times are not strictly increasing: {times}."
             )

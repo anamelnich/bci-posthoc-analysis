@@ -40,6 +40,34 @@ EXPECTED_PERFORMANCE_FIELDS = {
 }
 
 
+def _save_figure_with_png(fig, output_path):
+    """Save a figure to the requested path and a PDF/PNG companion."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_format = output_path.suffix.lstrip(".") or "pdf"
+    primary_kwargs = {"dpi": 300} if output_format == "png" else {}
+    fig.savefig(
+        output_path,
+        format=output_format,
+        bbox_inches="tight",
+        **primary_kwargs,
+    )
+    print(f"Saved figure: {output_path}")
+
+    companion_suffix = ".png" if output_path.suffix.lower() == ".pdf" else ".pdf"
+    companion_path = output_path.with_suffix(companion_suffix)
+    companion_format = companion_suffix.lstrip(".")
+    companion_kwargs = {"dpi": 300} if companion_format == "png" else {}
+    fig.savefig(
+        companion_path,
+        format=companion_format,
+        bbox_inches="tight",
+        **companion_kwargs,
+    )
+    print(f"Saved figure: {companion_path}")
+    return output_path
+
+
 def _loadmat(filepath):
     """Load one MATLAB v5 file with an informative dependency error."""
     try:
@@ -511,10 +539,7 @@ def plot_decoder_rl_performance_by_group(
 
         if save:
             output_path = Path(output_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(output_path, format="pdf", bbox_inches="tight")
-            print(f"Saved figure: {output_path}")
-            saved_path = output_path
+            saved_path = _save_figure_with_png(fig, output_path)
         else:
             saved_path = None
 
