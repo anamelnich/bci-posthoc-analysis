@@ -505,10 +505,28 @@ def _extract_training_stimulus_events_from_status(raw, stim_channel="Status"):
     stimulus_mask = np.isin(task_events[:, 2], list(STIMULUS_CODES))
     stimulus_events = task_events[stimulus_mask]
     if fixation_count != TRAINING_TRIALS:
-        raise ValueError(
-            f"Expected {TRAINING_TRIALS} fixation Status events, got "
-            f"{fixation_count}."
-        )
+        fixation_indices = np.flatnonzero(task_events[:, 2] == FIXATION_CODE)
+        near_stimulus_fixations = [
+            index for index in fixation_indices
+            if index > 0
+            and int(task_events[index - 1, 2]) in STIMULUS_CODES
+            and int(task_events[index, 0] - task_events[index - 1, 0]) <= 10
+        ]
+        # e29 has one documented duplicate fixation 8 samples after a stimulus.
+        # This narrow exception cannot alter stimulus-locked epoch anchors; all
+        # other fixation-count discrepancies remain strict validation failures.
+        if fixation_count == TRAINING_TRIALS + 1 and len(near_stimulus_fixations) == 1:
+            duplicate_index = near_stimulus_fixations[0]
+            print(
+                "WARNING: retaining one extra fixation Status event immediately after "
+                f"a stimulus ({int(task_events[duplicate_index, 0] - task_events[duplicate_index - 1, 0])} samples); "
+                "stimulus-locked epoching is unaffected."
+            )
+        else:
+            raise ValueError(
+                f"Expected {TRAINING_TRIALS} fixation Status events, got "
+                f"{fixation_count}; near-stimulus duplicates={len(near_stimulus_fixations)}."
+            )
     if len(stimulus_events) != TRAINING_TRIALS:
         raise ValueError(
             f"Expected {TRAINING_TRIALS} stimulus Status events for epoching, "

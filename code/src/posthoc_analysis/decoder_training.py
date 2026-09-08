@@ -717,11 +717,17 @@ def run_leave_one_run_out_feature_cv(
         if np.any(training_mask & heldout_mask):
             raise RuntimeError(f"Fold {fold_number}: balancing selected held-out trials.")
         training_classes = np.unique(labels[training_mask])
-        if not np.array_equal(training_classes, np.array([0, 1])):
+        training_class_counts = np.bincount(labels[training_mask], minlength=2)
+        if (
+            not np.array_equal(training_classes, np.array([0, 1]))
+            or np.any(training_class_counts < 2)
+        ):
             raise ValueError(
                 f"Fold {fold_number} (held-out run {heldout_run_id}) is untrainable "
                 f"after balancing: n_training={int(training_mask.sum())}, "
-                f"classes={training_classes.tolist()}."
+                f"classes={training_classes.tolist()}, "
+                f"class_counts={training_class_counts.tolist()}; each LDA class requires "
+                "at least two training trials."
             )
         feature_pipeline = fit_fold_feature_pipeline(
             epochs[:, :, training_mask],
@@ -1275,7 +1281,7 @@ def build_longitudinal_evaluation_manifest(subject_ids=None, project_root=PROJEC
         raise ValueError("subject_ids is empty.")
     print("LONGITUDINAL FEATURE-EVALUATION INPUT VALIDATION")
     print("Targets: Session 1 pre-intervention training + decoding Sessions 1-5.")
-    manifest_rows, trial_tables, issues = [], [], []
+    manifest_rows, trial_tables, issues, skipped_runs = [], [], [], []
     task_specs = [("session1_training_pre", 1, "training")]
     task_specs.extend(("decoding", session_id, "decoding") for session_id in range(1, 6))
     for subject_id in subjects:
@@ -1624,6 +1630,179 @@ def build_session5_training_model_manifest(
     }
 
 
+def build_session5_training_post_evaluation_manifest(subject_ids=None, project_root=PROJECT_ROOT):
+    """Return validated full Session-5 training runs as a post-training evaluation set.
+
+    This reuses the strict four-run Session-5 training manifest used to build
+    the frozen references, but labels the data as an evaluation target.  It
+    does not retain or apply the clean-trial mask: all valid trials are kept.
+    """
+    inputs = build_session5_training_model_manifest(
+        subject_ids=subject_ids, project_root=project_root
+    )
+    manifest = inputs["manifest"].copy()
+    trials = inputs["trials"].copy()
+    manifest.insert(2, "evaluation_task", "session5_training_post")
+    trials.insert(2, "evaluation_task", "session5_training_post")
+    summary = manifest.groupby(["evaluation_task", "session_id", "group"], sort=True).agg(
+        n_subjects=("subject_id", "nunique"),
+        n_runs=("run_id", "size"),
+        n_trials=("n_trials", "sum"),
+        no_distractor=("n_no_distractor", "sum"),
+        distractor_right=("n_distractor_right", "sum"),
+        distractor_left=("n_distractor_left", "sum"),
+    ).reset_index()
+    if not manifest["evaluation_task"].eq("session5_training_post").all():
+        raise RuntimeError("Session-5 post-training manifest task labeling failed.")
+    if not trials["evaluation_task"].eq("session5_training_post").all():
+        raise RuntimeError("Session-5 post-training trial-table task labeling failed.")
+    print("Session-5 post-training evaluation manifest passed.")
+    print("  Full valid trials retained; clean-trial selection is not applied during evaluation.")
+    return {"manifest": manifest, "trials": trials, "summary": summary, "issues": pd.DataFrame()}
+
+
+def build_session5_decoding_model_manifest(subject_ids=None, project_root=PROJECT_ROOT):
+    """Validate complete Session-5 decoding inputs for new exploratory references.
+
+    This is deliberately distinct from the Session-5 training reference
+    manifest. It uses only full, non-practice decoding runs and their decoding
+    task labels. Each participant must have every documented Session-5 run;
+    partial source data are not silently used to select a new feature set.
+    """
+    project_root = Path(project_root)
+    subjects = [str(subject).lower().strip() for subject in (
+        EXPECTED_SUBJECTS if subject_ids is None else subject_ids
+    )]
+    if not subjects or len(set(subjects)) != len(subjects):
+        raise ValueError("subject_ids must contain one or more unique participant IDs.")
+    unknown = sorted(set(subjects).difference(EXPECTED_SUBJECTS))
+    if unknown:
+        raise ValueError(f"Unknown participant ID(s): {unknown}.")
+    manifest_rows, trial_tables, issues, skipped_runs = [], [], [], []
+    print("SESSION-5 DECODING REFERENCE INPUT VALIDATION")
+    print("Source data: complete, non-practice Session-5 decoding runs only.")
+    for subject_id in subjects:
+        run_files, file_issues = _get_nonpractice_task_run_files(
+            subject_id, session_id=5, task="decoding", project_root=project_root
+        )
+        expected_runs = _expected_evaluation_run_count(subject_id, 5, "decoding")
+        if len(run_files) == expected_runs + 1:
+            skipped_run_id, skipped = run_files[0]
+            run_files = run_files[1:]
+            skipped_runs.append({
+                "subject_id": subject_id, "run_id": skipped_run_id,
+                "issue": "skipped first extra non-practice-labeled run as practice-like",
+                "gdf_path": str(skipped),
+            })
+        for issue in file_issues:
+            issues.append({"subject_id": subject_id, **issue})
+        if len(run_files) != expected_runs:
+            issues.append({
+                "subject_id": subject_id, "run_id": pd.NA,
+                "issue": "non-practice run count mismatch",
+                "expected_runs": expected_runs, "found_runs": len(run_files),
+            })
+            continue
+        for run_id, gdf_path in run_files:
+            try:
+                trials, row = _build_evaluation_run_trial_table(
+                    subject_id, session_id=5, run_id=run_id, gdf_path=gdf_path,
+                    evaluation_task="decoding",
+                )
+                row["reference_source"] = "session5_decoding"
+                trials["reference_source"] = "session5_decoding"
+                manifest_rows.append(row)
+                trial_tables.append(trials)
+            except Exception as exc:
+                issues.append({
+                    "subject_id": subject_id, "run_id": run_id, "gdf_path": str(gdf_path),
+                    "issue": f"run validation failed: {exc}",
+                })
+    if issues:
+        issue_table = pd.DataFrame(issues)
+        raise ValueError(
+            "Session-5 decoding reference manifest is incomplete; no model selection may proceed. "
+            f"Issues: {issue_table.to_dict('records')}"
+        )
+    manifest = pd.DataFrame(manifest_rows).sort_values(
+        ["group", "subject_id", "run_id"], kind="stable"
+    ).reset_index(drop=True)
+    trials = pd.concat(trial_tables, ignore_index=True)
+    expected_total_runs = sum(
+        _expected_evaluation_run_count(subject_id, 5, "decoding") for subject_id in subjects
+    )
+    if len(manifest) != expected_total_runs or not manifest["n_trials"].eq(TRAINING_TRIALS).all():
+        raise RuntimeError("Session-5 decoding manifest has an invalid run or trial count.")
+    if not manifest["status_event_alignment"].eq("pass").all():
+        raise RuntimeError("A Session-5 decoding source run failed Status-event alignment.")
+    for side in ("right", "left"):
+        include = trials[f"{side}_model_include"]
+        labels = trials.loc[include, f"{side}_model_label"]
+        if not set(labels.unique()).issubset({0, 1}) or set(labels.unique()) != {0, 1}:
+            raise RuntimeError(f"{side}: Session-5 decoding manifest lacks both binary classes.")
+    summary = manifest.groupby("group", sort=True).agg(
+        n_subjects=("subject_id", "nunique"), n_runs=("run_id", "size"),
+        n_trials=("n_trials", "sum"), no_distractor=("n_no_distractor", "sum"),
+        distractor_right=("n_distractor_right", "sum"),
+        distractor_left=("n_distractor_left", "sum"),
+    ).reset_index()
+    print("Session-5 decoding reference manifest passed.")
+    print(f"  Participants: {len(subjects)}; validated runs: {len(manifest)}; trials: {len(trials)}.")
+    if skipped_runs:
+        print(f"  Documented practice-like extra runs excluded: {len(skipped_runs)}.")
+    print(summary.to_string(index=False))
+    return {
+        "manifest": manifest,
+        "trials": trials,
+        "right_trials": trials.loc[trials["right_model_include"]].copy(),
+        "left_trials": trials.loc[trials["left_model_include"]].copy(),
+        "group_summary": summary,
+        "issues": pd.DataFrame(),
+        "skipped_runs": pd.DataFrame(skipped_runs),
+    }
+
+
+def preprocess_session5_decoding_subject(subject_id, session5_decoding_inputs):
+    """Preprocess one validated Session-5 decoding source dataset for new models.
+
+    Applies scalp-channel selection, zero-phase 0.1--20 Hz filtering,
+    Status-anchored stimulus epochs, and per-trial -200--0 ms baseline
+    correction. It does not fit xDAWN, normalization, feature ranking,
+    balancing, pruning, or a classifier.
+    """
+    if not isinstance(session5_decoding_inputs, dict) or not {"manifest", "trials"}.issubset(session5_decoding_inputs):
+        raise ValueError("session5_decoding_inputs must contain validated 'manifest' and 'trials' tables.")
+    subject_id = str(subject_id).lower().strip()
+    manifest = session5_decoding_inputs["manifest"]
+    trials = session5_decoding_inputs["trials"]
+    subject_manifest = manifest.loc[manifest["subject_id"].astype(str).str.lower().eq(subject_id)]
+    subject_trials = trials.loc[trials["subject_id"].astype(str).str.lower().eq(subject_id)]
+    if len(subject_manifest) != _expected_evaluation_run_count(subject_id, 5, "decoding"):
+        raise ValueError(f"{subject_id}: Session-5 decoding manifest does not contain its complete expected run set.")
+    if subject_trials.empty or not subject_manifest["evaluation_task"].eq("decoding").all():
+        raise ValueError(f"{subject_id}: source manifest must contain Session-5 decoding runs only.")
+    if not subject_manifest["session_id"].eq(5).all() or not subject_trials["session_id"].eq(5).all():
+        raise ValueError(f"{subject_id}: Session-5 decoding preprocessing received another session.")
+    if not subject_trials["evaluation_task"].eq("decoding").all():
+        raise ValueError(f"{subject_id}: trial table contains a non-decoding task.")
+    print(f"SESSION-5 DECODING MODEL PREPROCESSING: {subject_id}")
+    result = preprocess_longitudinal_evaluation_subject(subject_id, session5_decoding_inputs)
+    expected_trials = len(subject_manifest) * TRAINING_TRIALS
+    if result["epochs_time_channels_trials"].shape[2] != expected_trials:
+        raise RuntimeError(
+            f"{subject_id}: expected {expected_trials} full decoding epochs, "
+            f"got {result['epochs_time_channels_trials'].shape[2]}."
+        )
+    if not result["run_summary"]["session_id"].eq(5).all() or not result["run_summary"]["evaluation_task"].eq("decoding").all():
+        raise RuntimeError(f"{subject_id}: preprocessing output task/session labels changed unexpectedly.")
+    print(
+        f"{subject_id}: Session-5 decoding preprocessing passed: "
+        f"{len(result['run_summary'])} runs, {expected_trials} epochs, "
+        f"{len(result['eeg_labels'])} scalp EEG channels."
+    )
+    return result
+
+
 def validate_session5_analysis_channel_layout(manifest):
     """Verify one stable, label-derived scalp-EEG layout across Session 5 runs."""
     required = {"gdf_path", "channel_names"}
@@ -1827,7 +2006,7 @@ def preprocess_longitudinal_evaluation_subject(
     subject_trials = trials.loc[trials["subject_id"] == subject_id].copy()
     if subject_manifest.empty or subject_trials.empty:
         raise ValueError(f"{subject_id}: no validated longitudinal evaluation data were found.")
-    task_rank = {"session1_training_pre": 0, "decoding": 1}
+    task_rank = {"session1_training_pre": 0, "decoding": 1, "session5_training_post": 2}
     subject_manifest["_task_rank"] = subject_manifest["evaluation_task"].map(task_rank)
     if subject_manifest["_task_rank"].isna().any():
         raise ValueError(f"{subject_id}: manifest contains an unknown evaluation task.")
@@ -1842,8 +2021,13 @@ def preprocess_longitudinal_evaluation_subject(
             f"found {len(subject_trials)}."
         )
     print(f"\nLONGITUDINAL EVALUATION PREPROCESSING: {subject_id}")
+    task_session_pairs = set(zip(subject_manifest["evaluation_task"], subject_manifest["session_id"]))
+    if task_session_pairs == {("decoding", 5)}:
+        source_order = "Session-5 decoding source runs only"
+    else:
+        source_order = "Session 1 training (pre) -> Session 1--5 decoding -> Session 5 training (post, if present)"
     print(
-        "Order: Session 1 training (pre) -> Session 1--5 decoding; "
+        f"Order: {source_order}; "
         "scalp channels -> zero-phase 0.1-20 Hz FIR -> Status epochs -> baseline."
     )
     run_epochs, ordered_trial_tables, run_summaries = [], [], []
@@ -2303,20 +2487,31 @@ def construct_session5_conventional_difference_inputs(preprocessed_subject):
 
 def build_session5_top30_feature_references_for_subject(
     subject_id,
-    session5_model_inputs,
+    session5_model_inputs=None,
     n_pruning_iterations=20,
     random_seed=20260812,
+    preprocessed_subject=None,
 ):
     """Build frozen right/no and left/no Session-5 top-30 references.
 
-    This reproducible orchestration function uses only the supplied validated
-    four-run Session-5 training input.  For each decoder side it performs
-    conventional-pair construction, iterative pruning with leave-one-run-out
-    CV, then a final clean-trial xDAWN/z-score/r2 refit.  No decoding-session
-    data are used in selection.
+    This reproducible orchestration function performs conventional-pair
+    construction, iterative pruning with leave-one-run-out CV, then a final
+    clean-trial xDAWN/z-score/r2 refit. By default it preprocesses the
+    validated Session-5 training input. Advanced callers may instead provide
+    an already validated/preprocessed Session-5 source dataset, which is used
+    unchanged and must be documented by the caller.
     """
     subject_id = str(subject_id).lower().strip()
-    preprocessed = preprocess_session5_training_subject(subject_id, session5_model_inputs)
+    if preprocessed_subject is None:
+        if session5_model_inputs is None:
+            raise ValueError("session5_model_inputs is required when preprocessed_subject is not supplied.")
+        preprocessed = preprocess_session5_training_subject(subject_id, session5_model_inputs)
+    else:
+        preprocessed = preprocessed_subject
+        if not isinstance(preprocessed, dict) or not {"subject_id", "trial_table"}.issubset(preprocessed):
+            raise ValueError("preprocessed_subject must be a validated preprocessing-result dictionary.")
+        if str(preprocessed["subject_id"]).lower().strip() != subject_id:
+            raise ValueError("preprocessed_subject belongs to a different participant.")
     difference_inputs = construct_session5_conventional_difference_inputs(preprocessed)
     time = difference_inputs["time"]
     side_results = {}
@@ -2637,6 +2832,1441 @@ def load_session5_frozen_feature_reference(subject_id, decoder_side, output_dir=
         f"{len(selected_coordinates)} fixed features, xDAWN={reference['xdawn_filters_components_by_channels'].shape}."
     )
     return reference
+
+
+def evaluate_frozen_session5_features_for_subject(
+    subject_id,
+    longitudinal_inputs,
+    reference_dir=None,
+):
+    """Evaluate frozen Session-5 top-30 features for one participant.
+
+    Produces one long table with two explicitly distinct estimates: ``run``
+    rows use trials from one eligible run; ``session`` rows concatenate all
+    eligible runs within an evaluation task and session *before* calculating
+    r2.  It never refits xDAWN, normalization, feature selection, balancing,
+    pruning, or a classifier.
+    """
+    subject_id = str(subject_id).lower().strip()
+    if not isinstance(longitudinal_inputs, dict) or not {"manifest", "trials"}.issubset(longitudinal_inputs):
+        raise ValueError("longitudinal_inputs must contain validated 'manifest' and 'trials' tables.")
+    reference_dir = Path(reference_dir) if reference_dir is not None else REPO_ROOT / "analyses" / "session5_feature_references"
+    preprocessed = preprocess_longitudinal_evaluation_subject(subject_id, longitudinal_inputs)
+    difference_inputs = construct_session5_conventional_difference_inputs(preprocessed)
+    expected_time = np.asarray(difference_inputs["time"], dtype=float)
+    expected_labels = list(difference_inputs["difference_channel_labels"])
+    result_tables = []
+    frozen_references = {}
+
+    def _evaluate_subset(side, epochs, labels, trial_rows, aggregation_level, run_id, n_contributing_runs):
+        labels = np.asarray(labels, dtype=int)
+        if not np.array_equal(np.unique(labels), np.array([0, 1])):
+            raise ValueError(
+                f"{subject_id} {side} {aggregation_level}: expected both binary classes, "
+                f"found {np.unique(labels).tolist()}."
+            )
+        reference = frozen_references[side]
+        frozen_result = apply_frozen_feature_reference_and_compute_r2(epochs, labels, reference)
+        feature_rows = frozen_result["feature_r2_table"].copy()
+        task_values = trial_rows["evaluation_task"].unique()
+        session_values = trial_rows["session_id"].unique()
+        if len(task_values) != 1 or len(session_values) != 1:
+            raise ValueError(f"{subject_id} {side}: an r2 subset must belong to one task and session.")
+        feature_rows = feature_rows.drop(
+            columns=[column for column in ("subject_id", "decoder_side") if column in feature_rows],
+        )
+        feature_rows.insert(0, "subject_id", subject_id)
+        feature_rows.insert(1, "group", get_subject_group(subject_id))
+        feature_rows.insert(2, "decoder_side", side)
+        feature_rows.insert(3, "aggregation_level", aggregation_level)
+        feature_rows.insert(4, "evaluation_task", str(task_values[0]))
+        feature_rows.insert(5, "session_id", int(session_values[0]))
+        feature_rows.insert(6, "run_id", run_id)
+        feature_rows.insert(7, "n_contributing_runs", int(n_contributing_runs))
+        feature_rows.insert(8, "n_binary_trials", int(len(labels)))
+        feature_rows.insert(9, "n_no_distractor_trials", int((labels == 0).sum()))
+        feature_rows.insert(10, "n_relevant_distractor_trials", int((labels == 1).sum()))
+        return feature_rows
+
+    print(f"\nFROZEN SESSION-5 TOP-30 LONGITUDINAL EVALUATION: {subject_id}")
+    print("No xDAWN, normalization, or feature-selection quantity is refit on evaluation data.")
+    for side in ("right", "left"):
+        frozen_reference = load_session5_frozen_feature_reference(
+            subject_id, side, output_dir=reference_dir
+        )
+        if not np.array_equal(frozen_reference["epoch_time_s"], expected_time):
+            raise ValueError(f"{subject_id} {side}: evaluation epoch time axis differs from frozen Session-5 reference.")
+        if frozen_reference["difference_channel_labels"] != expected_labels:
+            raise ValueError(f"{subject_id} {side}: conventional difference-channel order differs from frozen reference.")
+        frozen_references[side] = frozen_reference
+
+    for side in ("right", "left"):
+        model_input = difference_inputs[side]
+        epochs = np.asarray(model_input["epochs_time_channels_trials"], dtype=float)
+        labels = np.asarray(model_input["labels"], dtype=int)
+        trials = model_input["trial_table"].reset_index(drop=True).copy()
+        if epochs.shape[2] != len(labels) or len(trials) != len(labels):
+            raise RuntimeError(f"{subject_id} {side}: binary epochs, labels, and trials are misaligned.")
+        task_rank = {"session1_training_pre": 0, "decoding": 1, "session5_training_post": 2}
+        run_groups = trials.assign(_task_rank=trials["evaluation_task"].map(task_rank)).groupby(
+            ["_task_rank", "evaluation_task", "session_id", "run_id"], sort=True, dropna=False
+        )
+        for (_, evaluation_task, session_id, run_id), run_trials in run_groups:
+            indices = run_trials.index.to_numpy(dtype=int)
+            if len(indices) == 0:
+                continue
+            result_tables.append(_evaluate_subset(
+                side, epochs[:, :, indices], labels[indices], run_trials,
+                aggregation_level="run", run_id=int(run_id), n_contributing_runs=1,
+            ))
+        session_groups = trials.assign(_task_rank=trials["evaluation_task"].map(task_rank)).groupby(
+            ["_task_rank", "evaluation_task", "session_id"], sort=True, dropna=False
+        )
+        for (_, evaluation_task, session_id), session_trials in session_groups:
+            indices = session_trials.index.to_numpy(dtype=int)
+            n_runs = int(session_trials["run_id"].nunique())
+            result_tables.append(_evaluate_subset(
+                side, epochs[:, :, indices], labels[indices], session_trials,
+                aggregation_level="session", run_id=pd.NA, n_contributing_runs=n_runs,
+            ))
+    r2_table = pd.concat(result_tables, ignore_index=True)
+    r2_table["run_id"] = r2_table["run_id"].astype("Int64")
+    identity = [
+        "subject_id", "decoder_side", "aggregation_level", "evaluation_task",
+        "session_id", "run_id", "rank",
+    ]
+    if r2_table.duplicated(identity).any():
+        raise RuntimeError(f"{subject_id}: longitudinal r2 output has duplicate feature identities.")
+    if not r2_table.groupby(["decoder_side", "aggregation_level", "evaluation_task", "session_id", "run_id"], dropna=False).size().eq(30).all():
+        raise RuntimeError(f"{subject_id}: every run/session r2 subset must contain exactly 30 features.")
+    run_rows = int((r2_table["aggregation_level"] == "run").sum() / 30)
+    session_rows = int((r2_table["aggregation_level"] == "session").sum() / 30)
+    print(
+        f"{subject_id}: frozen-feature r2 passed for {run_rows} runs and {session_rows} pooled sessions "
+        f"per decoder representation; output rows={len(r2_table)}."
+    )
+    return {
+        "subject_id": subject_id,
+        "r2_table": r2_table.sort_values(identity, kind="stable").reset_index(drop=True),
+        "run_qc": preprocessed["run_summary"].copy(),
+    }
+
+
+def save_longitudinal_frozen_r2_for_subject(evaluation_result, output_dir=None):
+    """Upsert one participant's run-wise and pooled-session frozen r2 rows."""
+    if not isinstance(evaluation_result, dict) or not {"subject_id", "r2_table"}.issubset(evaluation_result):
+        raise ValueError("evaluation_result must contain 'subject_id' and 'r2_table'.")
+    subject_id = str(evaluation_result["subject_id"]).lower().strip()
+    table = evaluation_result["r2_table"].copy()
+    required = {
+        "subject_id", "decoder_side", "aggregation_level", "evaluation_task", "session_id",
+        "run_id", "n_contributing_runs", "n_binary_trials", "rank", "r2_evaluation",
+    }
+    missing = required.difference(table.columns)
+    if missing:
+        raise ValueError(f"{subject_id}: r2 table is missing required columns {sorted(missing)}.")
+    if table.empty or not table["subject_id"].astype(str).str.lower().eq(subject_id).all():
+        raise ValueError(f"{subject_id}: r2 table is empty or contains another participant's rows.")
+    if set(table["aggregation_level"]) != {"run", "session"}:
+        raise ValueError(f"{subject_id}: r2 table must contain both run and session aggregation levels.")
+    output_dir = Path(output_dir) if output_dir is not None else REPO_ROOT / "analyses" / "session5_feature_references"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "longitudinal_top30_r2.parquet"
+    identity = [
+        "subject_id", "decoder_side", "aggregation_level", "evaluation_task",
+        "session_id", "run_id", "rank",
+    ]
+    if table.duplicated(identity).any():
+        raise ValueError(f"{subject_id}: r2 table has duplicate feature identities.")
+    if path.exists():
+        existing = pd.read_parquet(path)
+        missing_existing = set(table.columns).difference(existing.columns)
+        if missing_existing:
+            raise ValueError(
+                f"Existing {path.name} lacks current schema columns {sorted(missing_existing)}; migrate explicitly."
+            )
+        existing = existing.loc[~existing["subject_id"].astype(str).str.lower().eq(subject_id)]
+        combined = pd.concat([existing, table], ignore_index=True)
+    else:
+        combined = table
+    if combined.duplicated(identity).any():
+        raise RuntimeError(f"{path.name}: upsert produced duplicate feature identities.")
+    temporary_path = path.with_name(f".{path.stem}.tmp.parquet")
+    combined.to_parquet(temporary_path, index=False)
+    os.replace(temporary_path, path)
+    print(
+        f"Saved {subject_id} frozen-feature r2: {len(table)} rows for this participant; "
+        f"cohort table rows={len(combined)}."
+    )
+    return {"path": path, "r2_table": combined}
+
+
+def append_session5_training_post_frozen_r2(
+    subject_ids=None,
+    project_root=PROJECT_ROOT,
+    reference_dir=None,
+    persist=True,
+):
+    """Append full-dataset Session-5 training r² evaluations to the cohort table.
+
+    The frozen Session-5 transform is applied unchanged to all valid trials in
+    the four non-practice Session-5 training runs.  All participants are
+    evaluated before the existing cohort parquet is changed.  When ``persist``
+    is true, one atomic replacement appends the validated rows and a separate
+    audit log; a failed participant leaves the prior parquet untouched.
+    """
+    subjects = [str(subject).lower().strip() for subject in (
+        EXPECTED_SUBJECTS if subject_ids is None else subject_ids
+    )]
+    if not subjects or len(set(subjects)) != len(subjects):
+        raise ValueError("subject_ids must contain one or more unique participant IDs.")
+    unknown = sorted(set(subjects).difference(EXPECTED_SUBJECTS))
+    if unknown:
+        raise ValueError(f"Unknown participant ID(s): {unknown}.")
+    reference_dir = (
+        Path(reference_dir) if reference_dir is not None
+        else REPO_ROOT / "analyses" / "session5_feature_references"
+    )
+    r2_path = reference_dir / "longitudinal_top30_r2.parquet"
+    log_path = reference_dir / "longitudinal_top30_r2_session5_training_post_build_log.parquet"
+    if not r2_path.exists():
+        raise FileNotFoundError(f"Cannot append post-training r²: missing {r2_path}.")
+    existing = pd.read_parquet(r2_path)
+    identity = [
+        "subject_id", "decoder_side", "aggregation_level", "evaluation_task",
+        "session_id", "run_id", "rank",
+    ]
+    required_existing = set(identity).union({"r2_evaluation", "feature_index_zero_based", "group"})
+    missing_existing = required_existing.difference(existing.columns)
+    if missing_existing:
+        raise ValueError(f"{r2_path.name} is missing required columns {sorted(missing_existing)}.")
+    if existing.duplicated(identity).any():
+        raise RuntimeError(f"{r2_path.name} has duplicate feature identities before append.")
+    existing_post = existing.loc[existing["evaluation_task"].eq("session5_training_post")].copy()
+    if not existing_post.empty:
+        expected_existing_rows = len(subjects) * 2 * (SESSION5_TRAINING_RUNS + 1) * 30
+        requested_post = existing_post.loc[
+            existing_post["subject_id"].astype(str).str.lower().isin(subjects)
+        ].copy()
+        if (
+            len(requested_post) != expected_existing_rows
+            or requested_post.duplicated(identity).any()
+            or not requested_post["r2_evaluation"].between(0, 1).all()
+            or set(requested_post["subject_id"].astype(str).str.lower()) != set(subjects)
+        ):
+            raise ValueError(
+                "Session-5 post-training rows already exist but do not form a complete, "
+                "valid append for the requested participants. Refusing to overwrite them."
+            )
+        coverage = requested_post.groupby(
+            ["subject_id", "decoder_side", "aggregation_level"], dropna=False
+        ).size()
+        expected_coverage = {120, 30}
+        if set(coverage.to_numpy(dtype=int)) != expected_coverage:
+            raise ValueError("Existing post-training rows have incomplete run/session feature coverage.")
+        print("Session-5 post-training r² append already present and validated; no files changed.")
+        existing_log = pd.read_parquet(log_path) if log_path.exists() else pd.DataFrame()
+        return {
+            "post_training_inputs": None,
+            "appended_r2": requested_post.sort_values(identity, kind="stable").reset_index(drop=True),
+            "append_log": existing_log,
+            "r2_path": r2_path,
+            "append_log_path": log_path,
+            "persisted": False,
+        }
+    original = existing.copy()
+    post_inputs = build_session5_training_post_evaluation_manifest(
+        subject_ids=subjects, project_root=project_root
+    )
+    expected_manifest_runs = len(subjects) * SESSION5_TRAINING_RUNS
+    if len(post_inputs["manifest"]) != expected_manifest_runs:
+        raise RuntimeError(
+            f"Post-training manifest has {len(post_inputs['manifest'])} runs; "
+            f"expected {expected_manifest_runs}."
+        )
+    if not post_inputs["issues"].empty:
+        raise RuntimeError("Post-training manifest contains run issues; refusing a partial append.")
+
+    result_tables, log_rows = [], []
+    print(f"\nSESSION-5 FULL-DATA POST-TRAINING R² APPEND: {len(subjects)} participant(s)")
+    for subject_number, subject_id in enumerate(subjects, start=1):
+        print(f"\n[{subject_number}/{len(subjects)}] {subject_id}")
+        try:
+            result = evaluate_frozen_session5_features_for_subject(
+                subject_id, post_inputs, reference_dir=reference_dir
+            )
+            table = result["r2_table"].copy()
+            expected_rows = 2 * (SESSION5_TRAINING_RUNS + 1) * 30
+            if len(table) != expected_rows:
+                raise RuntimeError(
+                    f"Expected {expected_rows} post-training r² rows, got {len(table)}."
+                )
+            if set(table["evaluation_task"].unique()) != {"session5_training_post"}:
+                raise RuntimeError("Evaluation output contains an unexpected task label.")
+            if set(table["session_id"].unique()) != {5}:
+                raise RuntimeError("Post-training evaluation output must be Session 5 only.")
+            if table.duplicated(identity).any() or not table["r2_evaluation"].between(0, 1).all():
+                raise RuntimeError("Post-training output has duplicate identities or invalid r² values.")
+            for side in ("right", "left"):
+                reference = load_session5_frozen_feature_reference(subject_id, side, output_dir=reference_dir)
+                expected_features = reference["selected_coordinates"].sort_values("rank")
+                side_rows = table.loc[table["decoder_side"] == side]
+                for _, subset in side_rows.groupby(
+                    ["aggregation_level", "run_id"], dropna=False, sort=False
+                ):
+                    observed = subset.sort_values("rank")
+                    if not np.array_equal(
+                        observed["feature_index_zero_based"].to_numpy(dtype=int),
+                        expected_features["feature_index_zero_based"].to_numpy(dtype=int),
+                    ):
+                        raise RuntimeError(f"{subject_id} {side}: evaluated features differ from frozen top-30 reference.")
+                run_rows = side_rows.loc[side_rows["aggregation_level"] == "run"]
+                session_rows = side_rows.loc[side_rows["aggregation_level"] == "session"]
+                if (
+                    set(run_rows["run_id"].dropna().astype(int)) != set(range(1, SESSION5_TRAINING_RUNS + 1))
+                    or len(run_rows) != SESSION5_TRAINING_RUNS * 30
+                    or len(session_rows) != 30
+                    or not session_rows["n_contributing_runs"].eq(SESSION5_TRAINING_RUNS).all()
+                ):
+                    raise RuntimeError(f"{subject_id} {side}: post-training run/session coverage is incomplete.")
+            result_tables.append(table)
+            log_rows.append({
+                "subject_id": subject_id,
+                "group": get_subject_group(subject_id),
+                "append_status": "validated",
+                "n_r2_rows": int(len(table)),
+                "n_validated_runs": int(len(result["run_qc"])),
+                "n_session_subsets_per_decoder": 1,
+                "error_type": None,
+                "error_message": None,
+                "attempted_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+            })
+            print(f"{subject_id}: post-training rows validated; held in memory pending atomic cohort append.")
+        except Exception as exc:
+            log_rows.append({
+                "subject_id": subject_id,
+                "group": get_subject_group(subject_id),
+                "append_status": "failed",
+                "n_r2_rows": 0,
+                "n_validated_runs": 0,
+                "n_session_subsets_per_decoder": 0,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "attempted_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+            })
+            raise RuntimeError(
+                f"{subject_id}: post-training append validation failed; existing r² parquet was not changed. {exc}"
+            ) from exc
+
+    appended = pd.concat(result_tables, ignore_index=True)
+    expected_appended_rows = len(subjects) * 2 * (SESSION5_TRAINING_RUNS + 1) * 30
+    if len(appended) != expected_appended_rows or appended.duplicated(identity).any():
+        raise RuntimeError("Combined post-training append rows have an unexpected count or duplicate identities.")
+    overlap = appended.merge(existing[identity], on=identity, how="inner")
+    if not overlap.empty:
+        raise RuntimeError("Post-training append would overlap an existing r² identity.")
+    combined = pd.concat([existing, appended[existing.columns]], ignore_index=True)
+    if combined.duplicated(identity).any():
+        raise RuntimeError("Combined r² table has duplicate feature identities after append.")
+    if len(combined) != len(existing) + len(appended):
+        raise RuntimeError("Combined r² row count does not match the validated append.")
+    audit_log = pd.DataFrame(log_rows)
+    if persist:
+        temporary_r2_path = r2_path.with_name(f".{r2_path.stem}.session5_post.tmp.parquet")
+        combined.to_parquet(temporary_r2_path, index=False)
+        reread = pd.read_parquet(temporary_r2_path)
+        prior_reread = reread.loc[~reread["evaluation_task"].eq("session5_training_post")]
+        pd.testing.assert_frame_equal(
+            original.sort_values(identity, kind="stable").reset_index(drop=True),
+            prior_reread.sort_values(identity, kind="stable").reset_index(drop=True),
+            check_like=False,
+        )
+        if len(reread) != len(combined) or reread.duplicated(identity).any():
+            raise RuntimeError("Temporary post-training r² parquet failed read-back validation.")
+        os.replace(temporary_r2_path, r2_path)
+        temporary_log_path = log_path.with_name(f".{log_path.stem}.tmp.parquet")
+        audit_log.to_parquet(temporary_log_path, index=False)
+        os.replace(temporary_log_path, log_path)
+        print(f"Atomic append completed: {len(appended)} Session-5 post-training rows added.")
+        print(f"Updated r² table: {r2_path}")
+        print(f"Append audit log: {log_path}")
+    else:
+        print("Dry run passed: no files were changed.")
+    return {
+        "post_training_inputs": post_inputs,
+        "appended_r2": appended.sort_values(identity, kind="stable").reset_index(drop=True),
+        "append_log": audit_log,
+        "r2_path": r2_path,
+        "append_log_path": log_path,
+        "persisted": bool(persist),
+    }
+
+
+def run_checkpointed_longitudinal_frozen_r2_evaluation(
+    subject_ids=None,
+    project_root=PROJECT_ROOT,
+    reference_dir=None,
+    resume=True,
+):
+    """Evaluate frozen Session-5 features across a cohort with checkpoints.
+
+    The longitudinal manifest is validated once. Each participant's expensive
+    filtering, epoching, frozen-transform application, and both r2 levels are
+    then saved immediately. Existing participants are skipped only after their
+    run- and session-level rows match the current validated manifest.
+    """
+    subjects = [str(subject).lower().strip() for subject in (
+        EXPECTED_SUBJECTS if subject_ids is None else subject_ids
+    )]
+    if not subjects or len(set(subjects)) != len(subjects):
+        raise ValueError("subject_ids must contain one or more unique participant IDs.")
+    unknown = sorted(set(subjects).difference(EXPECTED_SUBJECTS))
+    if unknown:
+        raise ValueError(f"Unknown participant ID(s): {unknown}.")
+    reference_dir = Path(reference_dir) if reference_dir is not None else REPO_ROOT / "analyses" / "session5_feature_references"
+    reference_dir.mkdir(parents=True, exist_ok=True)
+    r2_path = reference_dir / "longitudinal_top30_r2.parquet"
+    log_path = reference_dir / "longitudinal_top30_r2_build_log.parquet"
+    longitudinal_inputs = build_longitudinal_evaluation_manifest(
+        subject_ids=subjects, project_root=project_root
+    )
+
+    def _existing_complete_subject(subject_id):
+        if not r2_path.exists():
+            return False
+        try:
+            table = pd.read_parquet(r2_path)
+            subject_rows = table.loc[table["subject_id"].astype(str).str.lower().eq(subject_id)].copy()
+            manifest_rows = longitudinal_inputs["manifest"].loc[
+                longitudinal_inputs["manifest"]["subject_id"].astype(str).str.lower().eq(subject_id)
+            ]
+            expected_run_keys = set(
+                zip(
+                    manifest_rows["evaluation_task"], manifest_rows["session_id"].astype(int),
+                    manifest_rows["run_id"].astype(int),
+                )
+            )
+            expected_session_keys = set(
+                zip(manifest_rows["evaluation_task"], manifest_rows["session_id"].astype(int))
+            )
+            for side in ("right", "left"):
+                side_rows = subject_rows.loc[subject_rows["decoder_side"] == side]
+                run_rows = side_rows.loc[side_rows["aggregation_level"] == "run"]
+                session_rows = side_rows.loc[side_rows["aggregation_level"] == "session"]
+                observed_run_keys = set(
+                    zip(run_rows["evaluation_task"], run_rows["session_id"].astype(int), run_rows["run_id"].astype(int))
+                )
+                observed_session_keys = set(
+                    zip(session_rows["evaluation_task"], session_rows["session_id"].astype(int))
+                )
+                if (
+                    observed_run_keys != expected_run_keys
+                    or observed_session_keys != expected_session_keys
+                    or len(run_rows) != 30 * len(expected_run_keys)
+                    or len(session_rows) != 30 * len(expected_session_keys)
+                    or not run_rows.groupby(["evaluation_task", "session_id", "run_id"], dropna=False).size().eq(30).all()
+                    or not session_rows.groupby(["evaluation_task", "session_id"], dropna=False).size().eq(30).all()
+                    or not side_rows["r2_evaluation"].between(0, 1).all()
+                ):
+                    return False
+        except (OSError, ValueError, KeyError, pd.errors.ParserError):
+            return False
+        return True
+
+    def _checkpoint_log(new_rows):
+        new_log = pd.DataFrame(new_rows)
+        if log_path.exists():
+            existing = pd.read_parquet(log_path)
+            existing = existing.loc[
+                ~existing["subject_id"].astype(str).str.lower().isin(
+                    new_log["subject_id"].astype(str).str.lower()
+                )
+            ]
+            combined = pd.concat([existing, new_log], ignore_index=True)
+        else:
+            combined = new_log
+        if combined.duplicated("subject_id").any():
+            raise RuntimeError("Longitudinal r2 build log has duplicate participant rows.")
+        temporary_path = log_path.with_name(f".{log_path.stem}.tmp.parquet")
+        combined.to_parquet(temporary_path, index=False)
+        os.replace(temporary_path, log_path)
+        return combined
+
+    print(f"\nLONGITUDINAL FROZEN TOP-30 R2 COHORT EVALUATION: {len(subjects)} participant(s)")
+    final_log = None
+    for subject_number, subject_id in enumerate(subjects, start=1):
+        print(f"\n[{subject_number}/{len(subjects)}] {subject_id}")
+        if resume and _existing_complete_subject(subject_id):
+            final_log = _checkpoint_log([{
+                "subject_id": subject_id,
+                "group": get_subject_group(subject_id),
+                "evaluation_status": "skipped_existing",
+                "n_r2_rows": int(pd.read_parquet(r2_path).query("subject_id == @subject_id").shape[0]),
+                "error_type": None,
+                "error_message": None,
+                "attempted_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+            }])
+            print(f"{subject_id}: existing complete run/session r2 rows verified; skipped.")
+            continue
+        try:
+            subject_result = evaluate_frozen_session5_features_for_subject(
+                subject_id, longitudinal_inputs, reference_dir=reference_dir
+            )
+            save_longitudinal_frozen_r2_for_subject(subject_result, output_dir=reference_dir)
+            final_log = _checkpoint_log([{
+                "subject_id": subject_id,
+                "group": get_subject_group(subject_id),
+                "evaluation_status": "completed",
+                "n_r2_rows": int(len(subject_result["r2_table"])),
+                "n_run_subsets_per_decoder": int(
+                    (subject_result["r2_table"]["aggregation_level"] == "run").sum() / 60
+                ),
+                "n_session_subsets_per_decoder": int(
+                    (subject_result["r2_table"]["aggregation_level"] == "session").sum() / 60
+                ),
+                "error_type": None,
+                "error_message": None,
+                "attempted_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+            }])
+        except Exception as exc:
+            final_log = _checkpoint_log([{
+                "subject_id": subject_id,
+                "group": get_subject_group(subject_id),
+                "evaluation_status": "failed",
+                "n_r2_rows": 0,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "attempted_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+            }])
+            print(f"WARNING: {subject_id} frozen-feature evaluation failed; checkpointed and continuing. {exc}")
+    if final_log is None:
+        raise RuntimeError("No longitudinal frozen-r2 evaluation records were generated.")
+    print("\nLongitudinal frozen top-30 r2 cohort evaluation finished.")
+    print(final_log["evaluation_status"].value_counts().to_string())
+    return {
+        "longitudinal_inputs": longitudinal_inputs,
+        "build_log": final_log.sort_values("subject_id", kind="stable").reset_index(drop=True),
+        "r2_path": r2_path,
+        "build_log_path": log_path,
+    }
+
+
+def summarize_session5_top30_selection_frequency(reference_dir=None):
+    """Summarize how often each frozen component-time feature was selected.
+
+    Frequencies are calculated separately by group and lateralized decoder,
+    with each participant contributing at most once to a candidate coordinate.
+    The complete candidate time grid comes from the saved transforms, so
+    coordinates never selected by anyone are retained with 0% frequency.
+    """
+    reference_dir = Path(reference_dir) if reference_dir is not None else REPO_ROOT / "analyses" / "session5_feature_references"
+    top30_path = reference_dir / "session5_reference_top30.parquet"
+    transform_paths = sorted((reference_dir / "transforms").glob("*_frozen_reference.npz"))
+    if not top30_path.exists() or not transform_paths:
+        raise FileNotFoundError(
+            "Expected frozen-reference top-30 table and transform files in "
+            f"{reference_dir}."
+        )
+    top30 = pd.read_parquet(top30_path)
+    required = {"subject_id", "decoder_side", "rank", "component", "time_index", "time_s"}
+    missing = required.difference(top30.columns)
+    if missing:
+        raise ValueError(f"{top30_path.name} is missing required columns {sorted(missing)}.")
+    if "group" not in top30.columns:
+        top30["group"] = top30["subject_id"].map(get_subject_group)
+    if top30["group"].isna().any():
+        raise ValueError("Could not derive a group label for every top-30 feature row.")
+    expected_subjects = set(EXPECTED_SUBJECTS)
+    if set(top30["subject_id"].astype(str).str.lower()) != expected_subjects:
+        raise ValueError("Top-30 feature table does not cover the full expected cohort.")
+    expected_counts = {"bci": 16, "control": 16}
+    observed_counts = top30.groupby("group")["subject_id"].nunique().to_dict()
+    if observed_counts != expected_counts:
+        raise ValueError(f"Unexpected group coverage in top-30 table: {observed_counts}.")
+    if not top30.groupby(["subject_id", "decoder_side"]).size().eq(30).all():
+        raise ValueError("Every participant/decoder reference must contain exactly 30 selected features.")
+    selected_identity = ["subject_id", "decoder_side", "component", "time_index"]
+    if top30.duplicated(selected_identity).any():
+        raise ValueError("A participant selected the same component-time feature more than once.")
+
+    with np.load(transform_paths[0], allow_pickle=False) as archive:
+        epoch_time = np.asarray(archive["epoch_time_s"], dtype=float)
+        resampled_indices = np.asarray(archive["resampled_indices"], dtype=int)
+    if resampled_indices.ndim != 1 or len(resampled_indices) == 0:
+        raise ValueError("Frozen transform has an invalid resampled time-index vector.")
+    candidate_time_s = epoch_time[resampled_indices]
+    for transform_path in transform_paths:
+        with np.load(transform_path, allow_pickle=False) as archive:
+            if not np.array_equal(np.asarray(archive["resampled_indices"], dtype=int), resampled_indices):
+                raise ValueError(f"{transform_path.name} has a different resampling grid.")
+            if not np.array_equal(np.asarray(archive["epoch_time_s"], dtype=float), epoch_time):
+                raise ValueError(f"{transform_path.name} has a different epoch time axis.")
+
+    grid = pd.MultiIndex.from_product(
+        [["bci", "control"], ["right", "left"], [1, 2], resampled_indices],
+        names=["group", "decoder_side", "component", "time_index"],
+    ).to_frame(index=False)
+    time_lookup = pd.DataFrame({"time_index": resampled_indices, "time_s": candidate_time_s})
+    grid = grid.merge(time_lookup, on="time_index", how="left", validate="many_to_one")
+    selected_counts = top30.groupby(
+        ["group", "decoder_side", "component", "time_index"], as_index=False
+    )["subject_id"].nunique().rename(columns={"subject_id": "n_selected_participants"})
+    summary = grid.merge(
+        selected_counts,
+        on=["group", "decoder_side", "component", "time_index"], how="left",
+        validate="one_to_one",
+    )
+    summary["n_selected_participants"] = summary["n_selected_participants"].fillna(0).astype(int)
+    summary["n_group_participants"] = summary["group"].map(expected_counts).astype(int)
+    summary["selection_frequency_pct"] = 100 * (
+        summary["n_selected_participants"] / summary["n_group_participants"]
+    )
+    if not summary["selection_frequency_pct"].between(0, 100).all():
+        raise RuntimeError("Selection frequencies must lie between 0% and 100%.")
+    print("Session-5 top-30 selection-frequency summary passed.")
+    print(
+        f"  Participants: BCI={expected_counts['bci']}, mental rehearsal={expected_counts['control']}; "
+        f"candidate times/component={len(resampled_indices)}."
+    )
+    return summary.sort_values(
+        ["decoder_side", "group", "component", "time_index"], kind="stable"
+    ).reset_index(drop=True)
+
+
+def plot_session5_top30_selection_frequency(
+    selection_frequency=None,
+    reference_dir=None,
+    output_dir=None,
+    filename_stem="session5_top30_feature_selection_frequency",
+):
+    """Plot group-wise stability of selected Session-5 component-time features."""
+    import matplotlib.pyplot as plt
+
+    if selection_frequency is None:
+        selection_frequency = summarize_session5_top30_selection_frequency(reference_dir)
+    frequency = selection_frequency.copy()
+    required = {
+        "group", "decoder_side", "component", "time_s", "selection_frequency_pct",
+        "n_group_participants",
+    }
+    missing = required.difference(frequency.columns)
+    if missing:
+        raise ValueError(f"selection_frequency is missing columns {sorted(missing)}.")
+    expected_rows = 2 * 2 * 2 * frequency["time_s"].nunique()
+    if len(frequency) != expected_rows:
+        raise ValueError(
+            f"Expected a complete 2 group x 2 decoder x 2 component grid; got {len(frequency)} rows."
+        )
+    if frequency.groupby(["group", "decoder_side", "component"]).size().nunique() != 1:
+        raise ValueError("Each group/decoder/component panel must use the same candidate time grid.")
+    times_ms = np.sort(frequency["time_s"].unique() * 1000)
+    if len(times_ms) < 2:
+        raise ValueError("At least two resampled time points are required for a selection-frequency plot.")
+    spacing_ms = float(np.median(np.diff(times_ms)))
+    component_gap_ms = max(120.0, 10 * spacing_ms)
+    component_1_x = times_ms
+    component_2_x = times_ms + (times_ms[-1] - times_ms[0]) + component_gap_ms
+    x_by_component = {1: component_1_x, 2: component_2_x}
+    ymax = max(25.0, float(np.ceil(frequency["selection_frequency_pct"].max() / 10.0) * 10.0))
+    ymax = min(100.0, ymax)
+    colors = {"bci": "#DD8452", "control": "#4C72B0"}
+    group_titles = {"bci": "BCI training", "control": "Mental rehearsal"}
+    decoder_titles = {
+        "right": "Right decoder\n(right distractor vs no distractor)",
+        "left": "Left decoder\n(left distractor vs no distractor)",
+    }
+    output_dir = Path(output_dir) if output_dir is not None else REPO_ROOT / "figures"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = output_dir / f"{filename_stem}.pdf"
+    png_path = output_dir / f"{filename_stem}.png"
+
+    with plt.rc_context({
+        "font.family": "sans-serif", "font.sans-serif": ["Arial", "DejaVu Sans"],
+        "font.size": 7, "axes.linewidth": 0.6, "xtick.major.width": 0.6,
+        "ytick.major.width": 0.6, "pdf.fonttype": 42, "ps.fonttype": 42,
+    }):
+        fig, axes = plt.subplots(2, 2, figsize=(6.5, 4.5), sharex=True, sharey=True)
+        for row, decoder_side in enumerate(("right", "left")):
+            for column, group in enumerate(("bci", "control")):
+                ax = axes[row, column]
+                panel = frequency.loc[
+                    (frequency["decoder_side"] == decoder_side) & (frequency["group"] == group)
+                ]
+                for component in (1, 2):
+                    component_rows = panel.loc[panel["component"] == component].sort_values("time_s")
+                    ax.plot(
+                        x_by_component[component], component_rows["selection_frequency_pct"],
+                        color=colors[group], marker="o", markersize=2.3, linewidth=1.1,
+                        markeredgewidth=0, clip_on=True,
+                    )
+                gap_start = component_1_x[-1] + spacing_ms / 2
+                gap_stop = component_2_x[0] - spacing_ms / 2
+                ax.axvspan(gap_start, gap_stop, color="0.95", zorder=0)
+                ax.axvline(gap_start, color="0.78", linewidth=0.5, zorder=1)
+                ax.axvline(gap_stop, color="0.78", linewidth=0.5, zorder=1)
+                ax.set_ylim(0, ymax)
+                ax.set_xlim(component_1_x[0] - spacing_ms, component_2_x[-1] + spacing_ms)
+                ax.set_yticks(np.arange(0, ymax + 0.1, 20 if ymax >= 60 else 10))
+                ax.tick_params(direction="out", length=2.5, pad=2)
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
+                if row == 0:
+                    ax.set_title(group_titles[group], fontsize=8, fontweight="bold", pad=17)
+                    ax.text(component_1_x.mean(), ymax * 1.035, "Component 1", ha="center", va="bottom", fontsize=6.5)
+                    ax.text(component_2_x.mean(), ymax * 1.035, "Component 2", ha="center", va="bottom", fontsize=6.5)
+                if column == 0:
+                    ax.set_ylabel("Participants selecting feature (%)")
+                    ax.text(
+                        -0.37, 0.5, decoder_titles[decoder_side], transform=ax.transAxes,
+                        rotation=90, ha="center", va="center", fontsize=7.5,
+                    )
+                if row == 1:
+                    tick_labels = np.array([200, 400, 600, 800, 1000])
+                    tick_values = np.array([
+                        times_ms[np.abs(times_ms - target).argmin()] for target in tick_labels
+                    ])
+                    ticks = np.concatenate([
+                        tick_values,
+                        tick_values + (times_ms[-1] - times_ms[0]) + component_gap_ms,
+                    ])
+                    ax.set_xticks(ticks)
+                    ax.set_xticklabels([str(int(value)) for value in np.concatenate([tick_labels, tick_labels])])
+                    ax.set_xlabel("Feature time after stimulus onset (ms)")
+                ax.text(-0.12, 1.08, chr(ord("a") + row * 2 + column), transform=ax.transAxes,
+                        fontsize=9, fontweight="bold", va="top")
+        fig.subplots_adjust(left=0.20, right=0.99, bottom=0.14, top=0.88, hspace=0.34, wspace=0.20)
+        fig.savefig(pdf_path, format="pdf", bbox_inches="tight")
+        fig.savefig(png_path, format="png", dpi=400, bbox_inches="tight")
+    plt.close(fig)
+    print("Session-5 top-30 selection-frequency figure passed.")
+    print(f"  Shared y-axis limits: 0 to {ymax:.0f}%.")
+    print(f"  Saved PDF: {pdf_path}")
+    print(f"  Saved PNG: {png_path}")
+    return {"pdf_path": pdf_path, "png_path": png_path, "selection_frequency": frequency, "y_limits": (0.0, ymax)}
+
+
+def summarize_longitudinal_top30_r2_by_session(reference_dir=None, n_features=30):
+    """Average frozen-feature r² within subject, then summarize it by assessment.
+
+    This uses only trial-pooled session-level estimates and retains the seven
+    assessments: full-dataset Session-1 training (pre-training), decoding on
+    intervention days 1--5, and full-dataset Session-5 training (post-training).
+    Right and left decoders remain separate because their feature sets and
+    target classes differ.
+    """
+    if not isinstance(n_features, (int, np.integer)) or not 1 <= int(n_features) <= 30:
+        raise ValueError("n_features must be an integer from 1 through 30.")
+    n_features = int(n_features)
+    reference_dir = (
+        Path(reference_dir) if reference_dir is not None
+        else REPO_ROOT / "analyses" / "session5_feature_references"
+    )
+    r2_path = reference_dir / "longitudinal_top30_r2.parquet"
+    if not r2_path.exists():
+        raise FileNotFoundError(f"Longitudinal frozen-feature r² table not found: {r2_path}")
+    r2 = pd.read_parquet(r2_path)
+    required = {
+        "subject_id", "group", "decoder_side", "aggregation_level",
+        "evaluation_task", "session_id", "rank", "r2_evaluation",
+    }
+    missing = required.difference(r2.columns)
+    if missing:
+        raise ValueError(f"{r2_path.name} is missing required columns {sorted(missing)}.")
+    assessment_specs = {
+        ("session1_training_pre", 1): (0, "Pre-training"),
+        ("decoding", 1): (1, "Intervention day 1"),
+        ("decoding", 2): (2, "Intervention day 2"),
+        ("decoding", 3): (3, "Intervention day 3"),
+        ("decoding", 4): (4, "Intervention day 4"),
+        ("decoding", 5): (5, "Intervention day 5"),
+        ("session5_training_post", 5): (6, "Post-training"),
+    }
+    subset = r2.loc[r2["aggregation_level"].eq("session")].copy()
+    subset["_assessment_key"] = list(zip(subset["evaluation_task"], subset["session_id"]))
+    subset = subset.loc[subset["_assessment_key"].isin(assessment_specs)].copy()
+    subset[["assessment_order", "assessment_label"]] = pd.DataFrame(
+        subset["_assessment_key"].map(assessment_specs).tolist(), index=subset.index
+    )
+    subset = subset.drop(columns="_assessment_key")
+    subset = subset.loc[subset["rank"].between(1, n_features)].copy()
+    if subset.empty:
+        raise ValueError("No pooled session-level r² rows were found for the seven assessments.")
+    subset["subject_id"] = subset["subject_id"].astype(str).str.lower()
+    if not subset["r2_evaluation"].between(0, 1).all():
+        raise ValueError("Session-level feature r² values must lie between 0 and 1.")
+    if set(subset["group"].unique()) != {"bci", "control"}:
+        raise ValueError("Both BCI and control groups must be present in the r² table.")
+    if set(subset["decoder_side"].unique()) != {"right", "left"}:
+        raise ValueError("Both right and left decoder sides must be present in the r² table.")
+    if subset.duplicated(["subject_id", "decoder_side", "assessment_order", "rank"]).any():
+        raise ValueError("Duplicate subject/decoder/assessment/rank r² rows were found.")
+
+    feature_counts = subset.groupby(
+        ["subject_id", "group", "decoder_side", "assessment_order", "assessment_label"], sort=False
+    )["rank"].agg(["size", "nunique"])
+    if not feature_counts["size"].eq(n_features).all() or not feature_counts["nunique"].eq(n_features).all():
+        invalid = feature_counts.loc[
+            ~feature_counts["size"].eq(30) | ~feature_counts["nunique"].eq(30)
+        ]
+        raise ValueError(
+            f"Every subject/decoder/assessment must have exactly {n_features} unique frozen features; "
+            f"invalid cells: {invalid.to_dict('index')}"
+        )
+    expected_subjects = set(EXPECTED_SUBJECTS)
+    observed_subjects = set(subset["subject_id"])
+    if observed_subjects != expected_subjects:
+        raise ValueError(
+            "Assessment-level r² does not cover the full expected cohort: "
+            f"missing={sorted(expected_subjects - observed_subjects)}, "
+            f"unexpected={sorted(observed_subjects - expected_subjects)}."
+        )
+
+    subject_session = (
+        subset.groupby(
+            ["subject_id", "group", "decoder_side", "assessment_order", "assessment_label"],
+            as_index=False, sort=True,
+        )
+        .agg(mean_r2=("r2_evaluation", "mean"), n_features=("r2_evaluation", "size"))
+    )
+    group_session = (
+        subject_session.groupby(
+            ["group", "decoder_side", "assessment_order", "assessment_label"],
+            as_index=False, sort=True,
+        )
+        .agg(mean_r2=("mean_r2", "mean"), sd_r2=("mean_r2", "std"),
+             n_subjects=("subject_id", "nunique"))
+    )
+    group_session["sem_r2"] = group_session["sd_r2"] / np.sqrt(group_session["n_subjects"])
+    if len(group_session) != 28 or not group_session["n_subjects"].eq(16).all():
+        raise ValueError(
+            "Expected 16 participants in every group/decoder/assessment cell; got "
+            f"{group_session[['group', 'decoder_side', 'assessment_label', 'n_subjects']].to_dict('records')}"
+        )
+    print(f"Longitudinal assessment-level top-{n_features} r² summary passed.")
+    print(f"  Pooled-session r²; {n_features} features per participant/decoder/assessment.")
+    print("  Assessments: pre-training, intervention days 1-5, post-training; BCI=16, mental rehearsal=16.")
+    return {
+        "subject_session": subject_session,
+        "group_session": group_session,
+        "source_path": r2_path,
+        "n_features": n_features,
+    }
+
+
+def plot_longitudinal_top30_r2_by_session(
+    r2_summary=None,
+    reference_dir=None,
+    output_dir=None,
+    filename_stem=None,
+):
+    """Plot group-average frozen top-30 r² trajectories with SEM across seven assessments."""
+    import matplotlib.pyplot as plt
+
+    if r2_summary is None:
+        r2_summary = summarize_longitudinal_top30_r2_by_session(reference_dir)
+    if not {"subject_session", "group_session"}.issubset(r2_summary):
+        raise ValueError("r2_summary must contain 'subject_session' and 'group_session' tables.")
+    n_features = int(r2_summary.get("n_features", 30))
+    if not 1 <= n_features <= 30:
+        raise ValueError("r2_summary has an invalid n_features value.")
+    subject_session = r2_summary["subject_session"].copy()
+    group_session = r2_summary["group_session"].copy()
+    required_subject = {"subject_id", "group", "decoder_side", "assessment_order", "mean_r2"}
+    required_group = {
+        "group", "decoder_side", "assessment_order", "assessment_label",
+        "mean_r2", "sem_r2", "n_subjects",
+    }
+    if missing := required_subject.difference(subject_session.columns):
+        raise ValueError(f"subject_session is missing columns {sorted(missing)}.")
+    if missing := required_group.difference(group_session.columns):
+        raise ValueError(f"group_session is missing columns {sorted(missing)}.")
+
+    output_dir = Path(output_dir) if output_dir is not None else REPO_ROOT / "figures"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if filename_stem is None:
+        filename_stem = f"longitudinal_top{n_features}_feature_r2_by_session"
+    colors = {"bci": "#DD8452", "control": "#4C72B0"}
+    labels = {"bci": "BCI training", "control": "Mental rehearsal"}
+    panel_titles = {
+        "right": "Right decoder (right distractor vs no distractor)",
+        "left": "Left decoder (left distractor vs no distractor)",
+    }
+    all_bounds = np.r_[
+        (group_session["mean_r2"] - group_session["sem_r2"]).to_numpy(),
+        (group_session["mean_r2"] + group_session["sem_r2"]).to_numpy(),
+    ]
+    y_lower = max(0.0, float(np.floor((all_bounds.min() - 0.001) / 0.01) * 0.01))
+    y_upper = float(np.ceil((all_bounds.max() + 0.001) / 0.01) * 0.01)
+    if y_upper <= y_lower:
+        y_upper = y_lower + 0.01
+
+    with plt.rc_context({
+        "font.family": "sans-serif", "font.sans-serif": ["Arial", "DejaVu Sans"],
+        "font.size": 7, "axes.linewidth": 0.65, "xtick.major.width": 0.65,
+        "ytick.major.width": 0.65, "pdf.fonttype": 42, "ps.fonttype": 42,
+    }):
+        fig, axes = plt.subplots(1, 2, figsize=(7.0, 3.25), sharey=True)
+        for panel_index, (ax, side) in enumerate(zip(axes, ("right", "left"))):
+            for group in ("bci", "control"):
+                means = group_session.loc[
+                    (group_session["decoder_side"] == side) & (group_session["group"] == group)
+                ].sort_values("assessment_order")
+                x = means["assessment_order"].to_numpy(dtype=float)
+                mean = means["mean_r2"].to_numpy(dtype=float)
+                sem = means["sem_r2"].to_numpy(dtype=float)
+                ax.fill_between(x, mean - sem, mean + sem, color=colors[group], alpha=0.16, linewidth=0)
+                ax.plot(x, mean, color=colors[group], marker="o", markersize=3.1,
+                        linewidth=1.25, label=labels[group], zorder=3)
+            ax.set_title(panel_titles[side], pad=6)
+            ax.set_xlim(-0.20, 6.20)
+            ax.set_ylim(y_lower, y_upper)
+            ax.set_xticks(np.arange(0, 7))
+            ax.set_xticklabels([
+                "Pre-\ntraining", "Day 1", "Day 2", "Day 3", "Day 4", "Day 5",
+                "Post-\ntraining",
+            ])
+            ax.tick_params(direction="out", length=3.0, width=0.65)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.set_xlabel("Training timeline (intervention days 1–5)")
+            ax.text(-0.20, 1.02, chr(ord("a") + panel_index), transform=ax.transAxes,
+                    fontsize=9, fontweight="bold", va="bottom")
+        axes[0].set_ylabel(f"Mean r² across frozen top-{n_features} features")
+        axes[1].legend(frameon=False, loc="upper left", handlelength=1.7)
+        fig.text(0.50, 0.01,
+                 "Lines and shading, group mean ± SEM across participants (n = 16/group).",
+                 ha="center", va="bottom", fontsize=6.3)
+        fig.subplots_adjust(left=0.11, right=0.99, bottom=0.24, top=0.88, wspace=0.18)
+        pdf_path = output_dir / f"{filename_stem}.pdf"
+        png_path = output_dir / f"{filename_stem}.png"
+        fig.savefig(pdf_path, format="pdf", bbox_inches="tight")
+        fig.savefig(png_path, format="png", dpi=400, bbox_inches="tight")
+    plt.close(fig)
+    print("Longitudinal top-30 r² figure passed.")
+    print(f"  Shared y-axis limits: {y_lower:.3f} to {y_upper:.3f} r².")
+    print(f"  Saved PDF: {pdf_path}")
+    print(f"  Saved PNG: {png_path}")
+    return {"pdf_path": pdf_path, "png_path": png_path, "y_limits": (y_lower, y_upper)}
+
+
+def summarize_longitudinal_top30_r2_combined_decoders(reference_dir=None, n_features=30):
+    """Combine right/left decoder r² equally within participant and assessment.
+
+    The aggregation order is fixed: feature r² values are averaged within each
+    participant/decoder/assessment, the two decoder means are averaged within
+    participant/assessment, then group means and between-participant SEM are
+    calculated. This prevents a decoder with more rows from receiving more
+    weight.
+    """
+    base = summarize_longitudinal_top30_r2_by_session(reference_dir, n_features=n_features)
+    n_features = int(base["n_features"])
+    decoder_subject = base["subject_session"].copy()
+    required = {
+        "subject_id", "group", "decoder_side", "assessment_order",
+        "assessment_label", "mean_r2", "n_features",
+    }
+    missing = required.difference(decoder_subject.columns)
+    if missing:
+        raise ValueError(f"Decoder-specific subject table is missing columns {sorted(missing)}.")
+    decoder_counts = decoder_subject.groupby(
+        ["subject_id", "group", "assessment_order", "assessment_label"], sort=False
+    )["decoder_side"].agg(["size", "nunique"])
+    if not decoder_counts["size"].eq(2).all() or not decoder_counts["nunique"].eq(2).all():
+        raise ValueError("Every participant/assessment must contain exactly one right and one left decoder mean.")
+    if not decoder_subject["n_features"].eq(n_features).all():
+        raise ValueError(
+            f"Each participant/decoder/assessment must represent exactly {n_features} frozen features."
+        )
+    subject_assessment = (
+        decoder_subject.groupby(
+            ["subject_id", "group", "assessment_order", "assessment_label"], as_index=False, sort=True
+        )
+        .agg(mean_r2=("mean_r2", "mean"), n_decoders=("decoder_side", "nunique"))
+    )
+    group_assessment = (
+        subject_assessment.groupby(
+            ["group", "assessment_order", "assessment_label"], as_index=False, sort=True
+        )
+        .agg(mean_r2=("mean_r2", "mean"), sd_r2=("mean_r2", "std"),
+             n_subjects=("subject_id", "nunique"))
+    )
+    group_assessment["sem_r2"] = group_assessment["sd_r2"] / np.sqrt(group_assessment["n_subjects"])
+    if len(group_assessment) != 14 or not group_assessment["n_subjects"].eq(16).all():
+        raise ValueError("Expected 16 participants in every group/assessment cell after decoder combination.")
+    print(f"Combined-decoder longitudinal top-{n_features} r² summary passed.")
+    print(f"  Order: mean within {n_features} features -> mean across right/left decoders -> group mean ± SEM.")
+    return {
+        "subject_assessment": subject_assessment,
+        "group_assessment": group_assessment,
+        "source_path": base["source_path"],
+        "n_features": n_features,
+    }
+
+
+def plot_longitudinal_top30_r2_combined_decoders(
+    combined_summary=None,
+    reference_dir=None,
+    output_dir=None,
+    filename_stem=None,
+):
+    """Plot the equal-weighted combined-decoder frozen-feature r² trajectory."""
+    import matplotlib.pyplot as plt
+
+    if combined_summary is None:
+        combined_summary = summarize_longitudinal_top30_r2_combined_decoders(reference_dir)
+    if "group_assessment" not in combined_summary:
+        raise ValueError("combined_summary must contain a 'group_assessment' table.")
+    n_features = int(combined_summary.get("n_features", 30))
+    if not 1 <= n_features <= 30:
+        raise ValueError("combined_summary has an invalid n_features value.")
+    summary = combined_summary["group_assessment"].copy()
+    required = {"group", "assessment_order", "assessment_label", "mean_r2", "sem_r2", "n_subjects"}
+    missing = required.difference(summary.columns)
+    if missing:
+        raise ValueError(f"group_assessment is missing columns {sorted(missing)}.")
+    if len(summary) != 14 or not summary["n_subjects"].eq(16).all():
+        raise ValueError("Combined-decoder plot requires 16 participants in each group/assessment cell.")
+    output_dir = Path(output_dir) if output_dir is not None else REPO_ROOT / "figures"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if filename_stem is None:
+        filename_stem = f"longitudinal_top{n_features}_feature_r2_combined_decoders"
+    colors = {"bci": "#DD8452", "control": "#4C72B0"}
+    labels = {"bci": "BCI training", "control": "Mental rehearsal"}
+    bounds = np.r_[
+        (summary["mean_r2"] - summary["sem_r2"]).to_numpy(),
+        (summary["mean_r2"] + summary["sem_r2"]).to_numpy(),
+    ]
+    y_lower = max(0.0, float(np.floor((bounds.min() - 0.001) / 0.01) * 0.01))
+    y_upper = float(np.ceil((bounds.max() + 0.001) / 0.01) * 0.01)
+    if y_upper <= y_lower:
+        y_upper = y_lower + 0.01
+    with plt.rc_context({
+        "font.family": "sans-serif", "font.sans-serif": ["Arial", "DejaVu Sans"],
+        "font.size": 7, "axes.linewidth": 0.65, "xtick.major.width": 0.65,
+        "ytick.major.width": 0.65, "pdf.fonttype": 42, "ps.fonttype": 42,
+    }):
+        fig, ax = plt.subplots(figsize=(4.1, 3.25))
+        for group in ("bci", "control"):
+            values = summary.loc[summary["group"] == group].sort_values("assessment_order")
+            x = values["assessment_order"].to_numpy(dtype=float)
+            mean = values["mean_r2"].to_numpy(dtype=float)
+            sem = values["sem_r2"].to_numpy(dtype=float)
+            ax.fill_between(x, mean - sem, mean + sem, color=colors[group], alpha=0.16, linewidth=0)
+            ax.plot(x, mean, color=colors[group], marker="o", markersize=3.1,
+                    linewidth=1.25, label=labels[group], zorder=3)
+        ax.set_xlim(-0.20, 6.20)
+        ax.set_ylim(y_lower, y_upper)
+        ax.set_xticks(np.arange(0, 7))
+        ax.set_xticklabels(["Pre-\ntraining", "Day 1", "Day 2", "Day 3", "Day 4", "Day 5", "Post-\ntraining"])
+        ax.set_xlabel("Training timeline (intervention days 1–5)")
+        ax.set_ylabel(f"Mean r² across frozen top-{n_features} features and decoders")
+        ax.tick_params(direction="out", length=3.0, width=0.65)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(frameon=False, loc="upper left", handlelength=1.7)
+        ax.text(-0.13, 1.02, "a", transform=ax.transAxes, fontsize=9, fontweight="bold", va="bottom")
+        fig.text(0.50, 0.01,
+                 "Lines and shading, group mean ± SEM across participants (n = 16/group).",
+                 ha="center", va="bottom", fontsize=6.3)
+        fig.subplots_adjust(left=0.17, right=0.99, bottom=0.25, top=0.95)
+        pdf_path = output_dir / f"{filename_stem}.pdf"
+        png_path = output_dir / f"{filename_stem}.png"
+        fig.savefig(pdf_path, format="pdf", bbox_inches="tight")
+        fig.savefig(png_path, format="png", dpi=400, bbox_inches="tight")
+    plt.close(fig)
+    print("Combined-decoder longitudinal top-30 r² figure passed.")
+    print(f"  Shared uncertainty-aware y-axis limits: {y_lower:.3f} to {y_upper:.3f} r².")
+    print(f"  Saved PDF: {pdf_path}")
+    print(f"  Saved PNG: {png_path}")
+    return {"pdf_path": pdf_path, "png_path": png_path, "y_limits": (y_lower, y_upper)}
+
+
+def run_top30_combined_decoder_intervention_slope_mixed_model(reference_dir=None):
+    """Test whether top-30 combined-decoder r² slopes differ by group on days 1--5.
+
+    The outcome is the equally weighted participant-level mean across the
+    right/left decoder means, calculated after averaging each decoder's 30
+    frozen features. The model uses only the independent decoding assessments
+    on intervention days 1--5; it deliberately excludes pre- and
+    post-training task values because the latter is selection-linked.
+    """
+    try:
+        import statsmodels.formula.api as smf
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise ImportError("statsmodels is required for the mixed-effects slope model.") from exc
+
+    combined = summarize_longitudinal_top30_r2_combined_decoders(
+        reference_dir=reference_dir, n_features=30
+    )
+    data = combined["subject_assessment"].loc[
+        combined["subject_assessment"]["assessment_order"].between(1, 5)
+    ].copy()
+    expected_rows = len(EXPECTED_SUBJECTS) * 5
+    if len(data) != expected_rows or data["subject_id"].nunique() != len(EXPECTED_SUBJECTS):
+        raise ValueError(
+            f"Expected {expected_rows} complete participant-day rows for days 1-5, got {len(data)}."
+        )
+    day_counts = data.groupby("subject_id")["assessment_order"].nunique()
+    if not day_counts.eq(5).all():
+        raise ValueError("Every participant must contribute all five intervention-day values.")
+    if not (data["mean_r2"] > 0).all() or not np.isfinite(data["mean_r2"]).all():
+        raise ValueError("The log-r² mixed model requires finite, strictly positive participant means.")
+    expected_group_counts = {"bci": 16, "control": 16}
+    observed_group_counts = data.groupby("group")["subject_id"].nunique().to_dict()
+    if observed_group_counts != expected_group_counts:
+        raise ValueError(f"Unexpected group coverage: {observed_group_counts}.")
+    data["intervention_day_centered"] = data["assessment_order"].astype(float) - 3.0
+    data["group_bci"] = data["group"].eq("bci").astype(int)
+    data["log_mean_r2"] = np.log(data["mean_r2"])
+
+    formula = "log_mean_r2 ~ intervention_day_centered * group_bci"
+    fit_attempts = [
+        ("random_intercept_and_day_slope", "~intervention_day_centered"),
+        ("random_intercept", "1"),
+    ]
+    fitted = None
+    fit_structure = None
+    fit_messages = []
+    for structure, re_formula in fit_attempts:
+        try:
+            model = smf.mixedlm(
+                formula, data=data, groups=data["subject_id"], re_formula=re_formula
+            )
+            candidate = model.fit(reml=False, method="lbfgs", maxiter=200, disp=False)
+            random_covariance = np.asarray(candidate.cov_re, dtype=float)
+            random_slope_supported = (
+                structure == "random_intercept_and_day_slope"
+                and candidate.converged
+                and random_covariance.shape == (2, 2)
+                and np.isfinite(random_covariance).all()
+                and random_covariance[1, 1] > 1e-8
+            )
+            if structure == "random_intercept_and_day_slope" and not random_slope_supported:
+                fit_messages.append(
+                    "Random day-slope fit was singular, non-converged, or had negligible slope variance; "
+                    "used the prespecified random-intercept fallback."
+                )
+                continue
+            if not candidate.converged:
+                fit_messages.append(f"{structure} fit did not converge.")
+                continue
+            fitted = candidate
+            fit_structure = structure
+            break
+        except Exception as exc:
+            fit_messages.append(f"{structure} fit failed: {type(exc).__name__}: {exc}")
+    if fitted is None:
+        raise RuntimeError("Mixed-effects model could not be fit. " + " ".join(fit_messages))
+
+    fixed = fitted.fe_params
+    fixed_se = fitted.bse_fe
+    fixed_p = fitted.pvalues.loc[fixed.index]
+    fixed_cov = fitted.cov_params().loc[fixed.index, fixed.index]
+    interaction_term = "intervention_day_centered:group_bci"
+    required_terms = {"Intercept", "intervention_day_centered", "group_bci", interaction_term}
+    if not required_terms.issubset(fixed.index):
+        raise RuntimeError(f"Mixed model lacks required fixed terms: {sorted(required_terms - set(fixed.index))}.")
+    z_critical = 1.959963984540054
+
+    def _linear_effect(name, weights):
+        weight_vector = pd.Series(0.0, index=fixed.index)
+        for term, weight in weights.items():
+            weight_vector.loc[term] = weight
+        estimate = float(weight_vector @ fixed)
+        variance = float(weight_vector @ fixed_cov @ weight_vector)
+        if variance < 0:
+            raise RuntimeError(f"Negative variance encountered for {name}.")
+        se = float(np.sqrt(variance))
+        z_value = estimate / se if se > 0 else np.nan
+        from scipy.stats import norm
+        p_value = float(2 * norm.sf(abs(z_value))) if np.isfinite(z_value) else np.nan
+        return {
+            "effect": name,
+            "estimate_log_r2_per_day": estimate,
+            "se": se,
+            "ci95_low": estimate - z_critical * se,
+            "ci95_high": estimate + z_critical * se,
+            "z": z_value,
+            "p_value": p_value,
+            "r2_ratio_per_day": float(np.exp(estimate)),
+            "ratio_ci95_low": float(np.exp(estimate - z_critical * se)),
+            "ratio_ci95_high": float(np.exp(estimate + z_critical * se)),
+        }
+
+    effects = pd.DataFrame([
+        _linear_effect("Control daily slope", {"intervention_day_centered": 1.0}),
+        _linear_effect("BCI daily slope", {
+            "intervention_day_centered": 1.0, interaction_term: 1.0,
+        }),
+        _linear_effect("BCI minus control daily slope", {interaction_term: 1.0}),
+    ])
+    fixed_effects = pd.DataFrame({
+        "term": fixed.index,
+        "estimate": fixed.to_numpy(dtype=float),
+        "se": fixed_se.to_numpy(dtype=float),
+        "z": (fixed / fixed_se).to_numpy(dtype=float),
+        "p_value": fixed_p.to_numpy(dtype=float),
+    })
+    print("TOP-30 COMBINED-DECODER INTERVENTION-DAY SLOPE MODEL")
+    print("  Outcome: log participant mean r²; days 1-5 decoding only.")
+    print(f"  Model: {formula} + {fit_structure.replace('_', ' ')}.")
+    print("  Direct group trajectory test: BCI minus control daily slope.")
+    print(effects.to_string(index=False, float_format=lambda value: f"{value:.6g}"))
+    if fit_messages:
+        print("  Fit notes: " + " ".join(fit_messages))
+    return {
+        "analysis_data": data.sort_values(["subject_id", "assessment_order"]).reset_index(drop=True),
+        "effects": effects,
+        "fixed_effects": fixed_effects,
+        "model": fitted,
+        "model_structure": fit_structure,
+        "fit_notes": fit_messages,
+        "formula": formula,
+    }
+
+
+def run_top30_decoder_specific_intervention_slope_mixed_model(reference_dir=None):
+    """Test decoder-specific BCI/control top-30 r² trajectories on days 1--5.
+
+    This extension keeps right and left decoder means separate and fits a
+    day × group × decoder-side model. The three-way interaction tests whether
+    the BCI-versus-control slope difference differs by decoder. Planned group
+    slope-difference contrasts for the right and left decoder are Holm-adjusted
+    as one two-comparison family.
+    """
+    try:
+        import statsmodels.formula.api as smf
+        from statsmodels.stats.multitest import multipletests
+        from scipy.stats import norm
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise ImportError("statsmodels and scipy are required for the mixed-effects slope model.") from exc
+
+    base = summarize_longitudinal_top30_r2_by_session(reference_dir, n_features=30)
+    data = base["subject_session"].loc[
+        base["subject_session"]["assessment_order"].between(1, 5)
+    ].copy()
+    expected_rows = len(EXPECTED_SUBJECTS) * 2 * 5
+    if len(data) != expected_rows or data["subject_id"].nunique() != len(EXPECTED_SUBJECTS):
+        raise ValueError(
+            f"Expected {expected_rows} complete participant/decoder/day rows, got {len(data)}."
+        )
+    coverage = data.groupby(["subject_id", "decoder_side"])["assessment_order"].nunique()
+    if not coverage.eq(5).all() or set(data["decoder_side"]) != {"right", "left"}:
+        raise ValueError("Every participant/decoder must contribute all five intervention-day values.")
+    if not data["n_features"].eq(30).all() or not (data["mean_r2"] > 0).all():
+        raise ValueError("Decoder-specific model requires 30 strictly positive top-feature means per row.")
+    if data.groupby("group")["subject_id"].nunique().to_dict() != {"bci": 16, "control": 16}:
+        raise ValueError("Decoder-specific model requires 16 BCI and 16 control participants.")
+    data["intervention_day_centered"] = data["assessment_order"].astype(float) - 3.0
+    data["group_bci"] = data["group"].eq("bci").astype(int)
+    data["decoder_left"] = data["decoder_side"].eq("left").astype(int)
+    data["log_mean_r2"] = np.log(data["mean_r2"])
+
+    formula = "log_mean_r2 ~ intervention_day_centered * group_bci * decoder_left"
+    fit_attempts = [
+        ("random_intercept_and_day_slope", "~intervention_day_centered"),
+        ("random_intercept", "1"),
+    ]
+    fitted, fit_structure, fit_messages = None, None, []
+    for structure, re_formula in fit_attempts:
+        try:
+            model = smf.mixedlm(formula, data=data, groups=data["subject_id"], re_formula=re_formula)
+            candidate = model.fit(reml=False, method="lbfgs", maxiter=200, disp=False)
+            covariance = np.asarray(candidate.cov_re, dtype=float)
+            slope_supported = (
+                structure == "random_intercept_and_day_slope" and candidate.converged
+                and covariance.shape == (2, 2) and np.isfinite(covariance).all()
+                and covariance[1, 1] > 1e-8
+            )
+            if structure == "random_intercept_and_day_slope" and not slope_supported:
+                fit_messages.append("Random day-slope fit was not supported; used random-intercept fallback.")
+                continue
+            if not candidate.converged:
+                fit_messages.append(f"{structure} fit did not converge.")
+                continue
+            fitted, fit_structure = candidate, structure
+            break
+        except Exception as exc:
+            fit_messages.append(f"{structure} fit failed: {type(exc).__name__}: {exc}")
+    if fitted is None:
+        raise RuntimeError("Decoder-specific mixed model could not be fit. " + " ".join(fit_messages))
+
+    fixed = fitted.fe_params
+    fixed_cov = fitted.cov_params().loc[fixed.index, fixed.index]
+    terms = {
+        "day": "intervention_day_centered",
+        "day_group": "intervention_day_centered:group_bci",
+        "day_group_decoder": "intervention_day_centered:group_bci:decoder_left",
+    }
+    missing_terms = set(terms.values()).difference(fixed.index)
+    if missing_terms:
+        raise RuntimeError(f"Mixed model lacks required terms: {sorted(missing_terms)}.")
+    z_critical = 1.959963984540054
+
+    def _contrast(name, weights):
+        vector = pd.Series(0.0, index=fixed.index)
+        for term, weight in weights.items():
+            vector.loc[term] = weight
+        estimate = float(vector @ fixed)
+        variance = float(vector @ fixed_cov @ vector)
+        if variance < 0:
+            raise RuntimeError(f"Negative contrast variance for {name}.")
+        se = float(np.sqrt(variance))
+        z_value = estimate / se if se > 0 else np.nan
+        p_value = float(2 * norm.sf(abs(z_value))) if np.isfinite(z_value) else np.nan
+        low, high = estimate - z_critical * se, estimate + z_critical * se
+        return {
+            "contrast": name,
+            "estimate_log_r2_per_day": estimate,
+            "se": se,
+            "ci95_low": low,
+            "ci95_high": high,
+            "z": z_value,
+            "p_value": p_value,
+            "r2_ratio_per_day": float(np.exp(estimate)),
+            "ratio_ci95_low": float(np.exp(low)),
+            "ratio_ci95_high": float(np.exp(high)),
+        }
+
+    contrasts = pd.DataFrame([
+        _contrast("Right decoder: BCI minus control daily slope", {terms["day_group"]: 1.0}),
+        _contrast("Left decoder: BCI minus control daily slope", {
+            terms["day_group"]: 1.0, terms["day_group_decoder"]: 1.0,
+        }),
+    ])
+    contrasts["p_value_holm"] = multipletests(contrasts["p_value"], method="holm")[1]
+    three_way = _contrast(
+        "Decoder-side difference in BCI minus control daily slope",
+        {terms["day_group_decoder"]: 1.0},
+    )
+    fixed_effects = pd.DataFrame({
+        "term": fixed.index,
+        "estimate": fixed.to_numpy(dtype=float),
+        "se": fitted.bse_fe.to_numpy(dtype=float),
+        "z": (fixed / fitted.bse_fe).to_numpy(dtype=float),
+        "p_value": fitted.pvalues.loc[fixed.index].to_numpy(dtype=float),
+    })
+    print("TOP-30 DECODER-SPECIFIC INTERVENTION-DAY SLOPE MODEL")
+    print("  Outcome: log participant mean r²; days 1-5 decoding only.")
+    print(f"  Model: {formula} + {fit_structure.replace('_', ' ')}.")
+    print("  Decoder-specific group-slope contrasts use Holm correction (two contrasts).")
+    print(contrasts.to_string(index=False, float_format=lambda value: f"{value:.6g}"))
+    print("  Three-way interaction:")
+    print(pd.DataFrame([three_way]).to_string(index=False, float_format=lambda value: f"{value:.6g}"))
+    if fit_messages:
+        print("  Fit notes: " + " ".join(fit_messages))
+    return {
+        "analysis_data": data.sort_values(["subject_id", "decoder_side", "assessment_order"]).reset_index(drop=True),
+        "decoder_group_slope_contrasts": contrasts,
+        "three_way_interaction": pd.DataFrame([three_way]),
+        "fixed_effects": fixed_effects,
+        "model": fitted,
+        "model_structure": fit_structure,
+        "fit_notes": fit_messages,
+        "formula": formula,
+    }
+
+
+def run_top30_intervention_day_mixed_anovas(reference_dir=None):
+    """Run separate combined, right, and left 2-group × 5-day mixed ANOVAs.
+
+    Each model uses log participant mean r² from decoding-based intervention
+    days 1--5, categorical day, a between-participant group factor, and a
+    participant random intercept. Type-III Wald chi-square tests provide the
+    ANOVA-style tests of day, group, and their interaction. The combined model
+    is the primary analysis; the two decoder-specific group × day interactions
+    are Holm-corrected as a two-test follow-up family.
+    """
+    try:
+        import statsmodels.formula.api as smf
+        from statsmodels.stats.multitest import multipletests
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise ImportError("statsmodels is required for the mixed-ANOVA models.") from exc
+
+    combined = summarize_longitudinal_top30_r2_combined_decoders(
+        reference_dir=reference_dir, n_features=30
+    )["subject_assessment"].copy()
+    decoder = summarize_longitudinal_top30_r2_by_session(
+        reference_dir=reference_dir, n_features=30
+    )["subject_session"].copy()
+    datasets = {"combined_decoders": combined}
+    datasets.update({
+        side: decoder.loc[decoder["decoder_side"].eq(side)].copy()
+        for side in ("right", "left")
+    })
+    anova_rows, model_rows, fitted_models = [], [], {}
+    for outcome_name, values in datasets.items():
+        data = values.loc[values["assessment_order"].between(1, 5)].copy()
+        expected_rows = len(EXPECTED_SUBJECTS) * 5
+        if len(data) != expected_rows or data["subject_id"].nunique() != len(EXPECTED_SUBJECTS):
+            raise ValueError(f"{outcome_name}: expected {expected_rows} complete participant-day rows.")
+        if not data.groupby("subject_id")["assessment_order"].nunique().eq(5).all():
+            raise ValueError(f"{outcome_name}: every participant must contribute all five days.")
+        if outcome_name != "combined_decoders" and not data["n_features"].eq(30).all():
+            raise ValueError(f"{outcome_name}: requires 30 frozen features per participant/decoder/day.")
+        if not (data["mean_r2"] > 0).all():
+            raise ValueError(f"{outcome_name}: requires strictly positive top-30 participant means.")
+        if data.groupby("group")["subject_id"].nunique().to_dict() != {"bci": 16, "control": 16}:
+            raise ValueError(f"{outcome_name}: requires 16 participants per group.")
+        data["intervention_day"] = data["assessment_order"].astype(int).astype("category")
+        data["group_bci"] = data["group"].eq("bci").astype(int)
+        data["log_mean_r2"] = np.log(data["mean_r2"])
+        formula = "log_mean_r2 ~ C(intervention_day) * group_bci"
+        try:
+            fitted = smf.mixedlm(formula, data=data, groups=data["subject_id"]).fit(
+                reml=False, method="lbfgs", maxiter=200, disp=False
+            )
+        except Exception as exc:
+            raise RuntimeError(f"{outcome_name}: mixed ANOVA model failed: {exc}") from exc
+        if not fitted.converged:
+            raise RuntimeError(f"{outcome_name}: mixed ANOVA model did not converge.")
+        wald_table = fitted.wald_test_terms(skip_single=False).table.copy()
+        term_map = {
+            "C(intervention_day)": "Intervention day",
+            "group_bci": "Group",
+            "C(intervention_day):group_bci": "Group × intervention day",
+        }
+        missing_terms = set(term_map).difference(wald_table.index)
+        if missing_terms:
+            raise RuntimeError(f"{outcome_name}: ANOVA table lacks terms {sorted(missing_terms)}.")
+        for raw_term, display_term in term_map.items():
+            row = wald_table.loc[raw_term]
+            statistic = float(np.asarray(row["statistic"]).squeeze())
+            anova_rows.append({
+                "outcome": outcome_name,
+                "effect": display_term,
+                "chi2": statistic,
+                "df": int(row["df_constraint"]),
+                "p_value": float(np.asarray(row["pvalue"]).squeeze()),
+            })
+        model_rows.append({
+            "outcome": outcome_name,
+            "formula": formula,
+            "n_observations": int(len(data)),
+            "n_participants": int(data["subject_id"].nunique()),
+            "random_effect": "participant random intercept",
+            "converged": bool(fitted.converged),
+            "log_likelihood": float(fitted.llf),
+        })
+        fitted_models[outcome_name] = fitted
+    anova_table = pd.DataFrame(anova_rows)
+    decoder_interaction = anova_table.loc[
+        anova_table["outcome"].isin(["right", "left"])
+        & anova_table["effect"].eq("Group × intervention day")
+    ].copy()
+    corrected = multipletests(decoder_interaction["p_value"], method="holm")[1]
+    anova_table["p_value_holm_decoder_specific"] = np.nan
+    anova_table.loc[decoder_interaction.index, "p_value_holm_decoder_specific"] = corrected
+    print("TOP-30 INTERVENTION-DAY MIXED ANOVAS")
+    print("  Outcome: log participant mean r²; Days 1-5 decoding only.")
+    print("  Type-III Wald chi-square tests from participant-random-intercept mixed models.")
+    print("  Right/left Group × intervention day p-values are Holm-corrected together.")
+    print(anova_table.to_string(index=False, float_format=lambda value: f"{value:.6g}"))
+    return {
+        "anova_table": anova_table,
+        "model_info": pd.DataFrame(model_rows),
+        "models": fitted_models,
+    }
 
 
 def run_checkpointed_session5_reference_build(

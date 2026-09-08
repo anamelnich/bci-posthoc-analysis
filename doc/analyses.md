@@ -43,6 +43,17 @@ for longitudinal feature tracking:
 - `session5_reference_build_log.parquet` — checkpointed per-participant,
   per-decoder build status, selected pruning iteration, CV AUPRC, and any
   failure message. Retained as the model-selection audit trail.
+- `longitudinal_top30_r2.parquet` — final long-format feature-tracking result
+  table. It contains both run-wise r2 and session-wise r2 calculated after
+  pooling eligible trials across runs before r2 estimation. This is retained
+  because it requires applying frozen transforms to all raw EEG runs.
+- `longitudinal_top30_r2_build_log.parquet` — checkpointed participant-level
+  status for the raw-EEG frozen-reference evaluation. Retained to document
+  complete and failed evaluations without inferring missing rows as zero.
+- `longitudinal_top30_r2_session5_training_post_build_log.parquet` — audit of
+  the atomic append of full-dataset, four-run Session-5 training r² estimates.
+  These rows are labelled `session5_training_post` in the main r² table and
+  are selection-linked descriptive values, not independent performance data.
 - `transforms/{subject_id}_{decoder_side}_frozen_reference.npz` — one compact
   right and left transform per participant. Each contains the final
   Session-5 xDAWN filters, epoch-time and resampling indices, z-score means

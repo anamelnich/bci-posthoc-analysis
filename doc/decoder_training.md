@@ -117,11 +117,12 @@ is the mask *before* the iteration having the largest cross-validated AUPRC.
 The final original decoder is refit on all trials retained by that best mask;
 there is no additional final `balanceRuns` call in `computeDecoderRight`.
 
-For a new post-hoc model, a late pruning iteration can leave a fold with no
-balanced training trials. The implementation must stop before that untrainable
-iteration, retain all completed masks/history, and select the maximum-AUPRC
-mask among valid completed iterations. It must report the stop reason rather
-than fabricate trials or silently alter the pruning rule.
+For a new post-hoc model, a late pruning iteration can leave a fold without
+both classes or with fewer than two balanced trials in a class, which is
+insufficient for LDA fitting. The implementation must stop before that
+untrainable iteration, retain all completed masks/history, and select the
+maximum-AUPRC mask among valid completed iterations. It must report the stop
+reason rather than fabricate trials or silently alter the pruning rule.
 
 ## Classifier and posterior calibration
 
@@ -169,8 +170,10 @@ following intentional post-hoc settings:
 For each evaluation dataset, calculate r2 for these fixed features after the
 frozen transform. Compute the full eligible Session 5 training-data value as a
 descriptive reference, but label it as selection-linked because its features
-were chosen from that same task. The independent Session 1--5 decoding runs
-are the primary longitudinal evaluation dataset.
+were chosen from that same task. It must use all valid trials in the four
+non-practice Session-5 training runs, not the clean/pruned subset. The
+independent Session 1--5 decoding runs are the primary longitudinal evaluation
+dataset.
 
 Persist the final transform per participant and decoder: the xDAWN filters,
 full epoch-time axis, difference-channel order, feature-window/resampling
@@ -201,6 +204,12 @@ participant/decoder are valid. Apply the frozen reference to each complete
 evaluation run only. Longitudinal statistics should use the available
 subject-session values in a mixed-effects model; do not impute a missing EEG
 run or silently convert a partial session into a complete one.
+
+The validated e29 evaluation inventory includes one documented extra fixation
+Status marker eight samples after a stimulus. Because all 60 stimulus anchors
+and their conditions remain intact, it is retained under a narrow explicit QC
+waiver for stimulus-locked preprocessing; any other fixation-count discrepancy
+remains a validation failure.
 
 ## Implementation checks
 
