@@ -26,11 +26,31 @@ Design figures at their intended publication size:
 - Two horizontal panels: approximately 7.0 x 3.0--3.5 in.
 - Full-width multi-panel figures: approximately 7.0 x 5--7 in.
 
-Use Arial or Helvetica when available, with DejaVu Sans as the fallback. At the
-final publication size, use approximately 7 pt axis labels, 6--7 pt ticks and
-legend text, and 8--9 pt bold lowercase panel labels. Use thin axes and ticks
-(approximately 0.5--0.8 pt), outward-facing ticks, and left/bottom spines only
-unless additional spines are scientifically necessary.
+Use Times New Roman when available, with Times or DejaVu Serif as fallbacks.
+Use thin axes and ticks (approximately 0.5--0.8 pt), outward-facing ticks, and
+left/bottom spines only unless additional spines are scientifically necessary.
+
+### Typography profiles: paper versus poster
+
+When a figure request identifies its destination, use the corresponding
+profile below. If the destination is not stated, ask whether the figure is for
+a paper/publication or a poster before selecting typography. Use Times New
+Roman for both profiles.
+
+| Setting | Paper / publication profile | Poster profile |
+|---|---:|---:|
+| Title | Avoid a large in-plot title; use the manuscript figure legend instead | 15 pt, bold when a title is requested |
+| Axis labels | approximately 7 pt | 12 pt |
+| Tick labels | 6--7 pt | 10 pt |
+| Legend text | 6--7 pt | 10 pt |
+| Significance annotations | match tick-label size unless a figure-specific need requires otherwise | 10 pt |
+| Panel labels | 8--9 pt, bold lowercase | 12 pt, bold lowercase |
+
+The poster profile records the settings used for
+`behavioral_rt_change_barplot`: 15 pt title, 12 pt axis labels, and 10 pt
+ticks, legend, and significance labels. It is intended for the final displayed
+poster figure size; adjust the physical canvas dimensions to the poster layout
+while retaining this visual hierarchy unless the user specifies otherwise.
 
 Export both a vector PDF (or SVG) and a PNG preview at at least 300 dpi. Use
 `bbox_inches="tight"`, then verify that no legend, panel label, or other

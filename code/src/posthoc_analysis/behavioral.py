@@ -22,7 +22,7 @@ except ImportError as exc:
 else:
     _STATSMODELS_IMPORT_ERROR = None
 
-from .config import PROJECT_ROOT, BCI_GROUP_SUBJECTS
+from .config import PROJECT_ROOT, BCI_GROUP_SUBJECTS, CONTROL_GROUP_SUBJECTS
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -2673,6 +2673,708 @@ def _cohens_d_independent(sample_a, sample_b):
     return (np.mean(sample_a) - np.mean(sample_b)) / pooled_sd
 
 
+def summarize_training_rt_change_scores(df, tolerance_ms=1e-8):
+    """Compute validated participant-level post-minus-pre training RT changes.
+
+    This uses the exact preparation, pooled participant-by-session +/-3 SD
+    filtering, and participant-by-session-by-trial-type aggregation used by
+    :func:`analyze_reaction_time`. Change is defined as post minus pre, so
+    negative values indicate faster post-intervention reaction times.
+    """
+    _require_statistical_dependencies(require_scipy=True, require_statsmodels=False)
+
+    required_columns = {
+        "subject_id", "group", "session_id", "run_id", "task", "feedback", "rt_ms",
+    }
+    missing_columns = sorted(required_columns - set(df.columns))
+    if missing_columns:
+        raise ValueError(
+            "Training RT change analysis is missing required columns: "
+            f"{missing_columns}"
+        )
+
+    source_sessions = set(pd.to_numeric(df["session_id"], errors="coerce").dropna().astype(int))
+    if source_sessions != {1, 5}:
+        raise ValueError(
+            "Training RT change analysis requires exactly Session IDs {1, 5}; "
+            f"found {sorted(source_sessions)}."
+        )
+
+    source_groups = set(df["group"].dropna().astype(str))
+    expected_groups = {"experimental", "control"}
+    if source_groups != expected_groups:
+        raise ValueError(
+            "Training RT change analysis requires group labels "
+            f"{sorted(expected_groups)}; found {sorted(source_groups)}."
+        )
+
+    # Reuse the primary Analysis 1 functions so filtering and aggregation
+    # remain identical to the current RT figures and statistics.
+    trial_data, warnings_list, exclusion_report = _prepare_reaction_time_trial_data(df)
+    trial_data_clean, outlier_report = _remove_rt_outliers(trial_data)
+    subject_session_summary = _aggregate_subject_reaction_times(trial_data_clean)
+
+    summary_keys = ["subject_id", "group", "session", "trial_type"]
+    if subject_session_summary.duplicated(summary_keys).any():
+        duplicate_rows = subject_session_summary.loc[
+            subject_session_summary.duplicated(summary_keys, keep=False), summary_keys
+        ]
+        raise ValueError(
+            "Duplicate subject/session/trial-type RT summary rows were found:\n"
+            f"{duplicate_rows.to_string(index=False)}"
+        )
+
+    observed_trial_types = set(subject_session_summary["trial_type"])
+    expected_trial_types = {"distractor", "no_distractor"}
+    if observed_trial_types != expected_trial_types:
+        raise ValueError(
+            "Both distractor and no_distractor RT summaries are required; "
+            f"found {sorted(observed_trial_types)}."
+        )
+
+    wide = subject_session_summary.pivot(
+        index=["subject_id", "group", "trial_type"],
+        columns="session",
+        values="mean_rt_ms",
+    ).reset_index()
+    required_session_columns = {"pre", "post"}
+    missing_session_columns = required_session_columns - set(wide.columns)
+    if missing_session_columns:
+        raise ValueError(
+            "Could not form both pre and post RT values for change scores; "
+            f"missing {sorted(missing_session_columns)}."
+        )
+
+    incomplete = wide[wide[["pre", "post"]].isna().any(axis=1)]
+    if not incomplete.empty:
+        raise ValueError(
+            "Every retained subject x trial type must have one pre and one post RT value. "
+            "Incomplete rows:\n"
+            f"{incomplete.to_string(index=False)}"
+        )
+
+    change_scores = wide.rename(columns={"pre": "pre_rt_ms", "post": "post_rt_ms"})
+    change_scores["rt_change_ms"] = (
+        change_scores["post_rt_ms"] - change_scores["pre_rt_ms"]
+    )
+    change_scores = change_scores.sort_values(
+        ["trial_type", "group", "subject_id"]
+    ).reset_index(drop=True)
+
+    expected_subject_counts = {
+        "experimental": len(BCI_GROUP_SUBJECTS),
+        "control": len(CONTROL_GROUP_SUBJECTS),
+    }
+    subject_counts = (
+        change_scores.groupby(["group", "trial_type"], observed=False)["subject_id"]
+        .nunique()
+        .reset_index(name="n_subjects")
+    )
+    subject_counts["expected_n_subjects"] = subject_counts["group"].map(
+        expected_subject_counts
+    )
+    subject_counts["matches_expected"] = (
+        subject_counts["n_subjects"] == subject_counts["expected_n_subjects"]
+    )
+
+    change_summary = (
+        change_scores.groupby(["trial_type", "group"], observed=False)["rt_change_ms"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+        .rename(columns={"mean": "mean_rt_change_ms", "std": "sd_rt_change_ms", "count": "n_subjects"})
+    )
+    change_summary["sem_rt_change_ms"] = (
+        change_summary["sd_rt_change_ms"] / np.sqrt(change_summary["n_subjects"])
+    )
+
+    # Verify that the change-score group means agree with the endpoint means
+    # from the primary Analysis 1 participant-level RT summary.
+    endpoint_means = (
+        subject_session_summary.groupby(
+            ["trial_type", "group", "session"], observed=False
+        )["mean_rt_ms"]
+        .mean()
+        .unstack("session")
+        .reset_index()
+    )
+    endpoint_means["expected_mean_rt_change_ms"] = (
+        endpoint_means["post"] - endpoint_means["pre"]
+    )
+    agreement = change_summary.merge(
+        endpoint_means[
+            ["trial_type", "group", "expected_mean_rt_change_ms"]
+        ],
+        on=["trial_type", "group"],
+        how="left",
+        validate="one_to_one",
+    )
+    agreement["difference_ms"] = (
+        agreement["mean_rt_change_ms"]
+        - agreement["expected_mean_rt_change_ms"]
+    )
+    agreement["within_tolerance"] = agreement["difference_ms"].abs() <= tolerance_ms
+    if not agreement["within_tolerance"].all():
+        raise RuntimeError(
+            "RT change-score means do not agree with the primary RT endpoint "
+            "means within tolerance.\n"
+            f"{agreement.to_string(index=False)}"
+        )
+
+    welch_rows = []
+    for trial_type in ["distractor", "no_distractor"]:
+        subset = change_scores[change_scores["trial_type"] == trial_type]
+        bci_values = subset.loc[
+            subset["group"] == "experimental", "rt_change_ms"
+        ].to_numpy()
+        control_values = subset.loc[
+            subset["group"] == "control", "rt_change_ms"
+        ].to_numpy()
+        if len(bci_values) < 2 or len(control_values) < 2:
+            raise ValueError(
+                f"Welch test for {trial_type} requires at least two participants per group."
+            )
+
+        statistic, p_value = stats.ttest_ind(
+            bci_values, control_values, equal_var=False
+        )
+        ci_low, ci_high = _welch_mean_difference_ci(bci_values, control_values)
+        welch_rows.append({
+            "trial_type": trial_type,
+            "comparison": "BCI - Mental Rehearsal RT change",
+            "n_bci": len(bci_values),
+            "n_control": len(control_values),
+            "bci_mean_rt_change_ms": float(np.mean(bci_values)),
+            "mental_rehearsal_mean_rt_change_ms": float(np.mean(control_values)),
+            "estimate_ms": float(np.mean(bci_values) - np.mean(control_values)),
+            "statistic": statistic,
+            "df": _welch_df(bci_values, control_values),
+            "p_value": p_value,
+            "effect_size": _cohens_d_independent(bci_values, control_values),
+            "effect_size_label": "cohens_d",
+            "ci95_low_ms": ci_low,
+            "ci95_high_ms": ci_high,
+        })
+    welch_tests = pd.DataFrame(welch_rows)
+
+    print("TRAINING-TASK RT CHANGE-SCORE SANITY CHECKS")
+    print(f"  Source rows: {len(df)}")
+    print(f"  Retained RT trials after all filtering: {len(trial_data_clean)}")
+    print("  Subject counts by group and trial type:")
+    print(subject_counts.to_string(index=False))
+    print("  Change-score agreement with primary RT endpoint means:")
+    print(agreement.to_string(index=False))
+    print("  Welch BCI-versus-Mental-Rehearsal RT-change tests:")
+    print(welch_tests.to_string(index=False))
+    for row in welch_tests.itertuples(index=False):
+        print(
+            f"  {row.trial_type}: Welch t({row.df:.6f}) = {row.statistic:.6f}, "
+            f"p = {row.p_value:.12g}, Cohen's d = {row.effect_size:.6f}, "
+            f"BCI - Mental Rehearsal = {row.estimate_ms:.6f} ms"
+        )
+
+    return {
+        "trial_data_clean": trial_data_clean,
+        "outlier_report": outlier_report,
+        "exclusion_report": exclusion_report,
+        "subject_session_summary": subject_session_summary,
+        "change_scores": change_scores,
+        "change_summary": change_summary,
+        "welch_tests": welch_tests,
+        "subject_counts": subject_counts,
+        "agreement_with_primary_rt": agreement,
+        "warnings": warnings_list,
+    }
+
+
+def _significance_label(p_value):
+    """Return the requested compact significance label for a p-value."""
+    if p_value < 0.001:
+        return "***"
+    if p_value < 0.01:
+        return "**"
+    if p_value < 0.05:
+        return "*"
+    return "ns"
+
+
+def plot_training_rt_change_barplot(
+    change_scores,
+    change_summary,
+    welch_tests,
+    trial_order=("distractor", "no_distractor"),
+    trial_labels=None,
+    title="Distractor Task Post-Pre RT Change",
+):
+    """Plot BCI and Mental-Rehearsal post-minus-pre RT changes by trial type.
+
+    Bars show group means, error bars show between-participant SEM, and points
+    show individual post-minus-pre participant change scores.
+    """
+    required_change_columns = {"subject_id", "group", "trial_type", "rt_change_ms"}
+    required_summary_columns = {
+        "trial_type", "group", "mean_rt_change_ms", "sem_rt_change_ms",
+    }
+    required_test_columns = {"trial_type", "p_value"}
+    for name, table, required in [
+        ("change_scores", change_scores, required_change_columns),
+        ("change_summary", change_summary, required_summary_columns),
+        ("welch_tests", welch_tests, required_test_columns),
+    ]:
+        missing = sorted(required - set(table.columns))
+        if missing:
+            raise ValueError(f"{name} is missing required columns: {missing}")
+
+    trial_order = list(trial_order)
+    if len(trial_order) != 2 or len(set(trial_order)) != 2:
+        raise ValueError("RT-change barplots require exactly two distinct trial types.")
+    if trial_labels is None:
+        trial_labels = {
+            "distractor": "Distractor",
+            "no_distractor": "No distractor",
+        }
+    missing_trial_labels = sorted(set(trial_order) - set(trial_labels))
+    if missing_trial_labels:
+        raise ValueError(f"Missing display labels for trial types: {missing_trial_labels}")
+    group_order = ["experimental", "control"]
+    colors = {"experimental": "#DD8452", "control": "#4C72B0"}
+    labels = {"experimental": "BCI", "control": "Mental Rehearsal"}
+    positions = {trial_type: float(index) for index, trial_type in enumerate(trial_order)}
+    offsets = {"experimental": -0.19, "control": 0.19}
+    bar_width = 0.30
+
+    figure_rcparams = _publication_style_rcparams().copy()
+    figure_rcparams.update({
+        "font.family": "Times New Roman",
+        "axes.titlesize": 15,
+        "axes.labelsize": 12,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "legend.fontsize": 10,
+    })
+    with plt.rc_context(figure_rcparams):
+        fig, ax = plt.subplots(figsize=(3.7, 5.0))
+        rng = np.random.default_rng(20260921)
+        plotted_values = []
+        pair_tops = {}
+
+        for trial_type in trial_order:
+            pair_tops[trial_type] = []
+            for group in group_order:
+                summary_row = change_summary[
+                    (change_summary["trial_type"] == trial_type)
+                    & (change_summary["group"] == group)
+                ]
+                if len(summary_row) != 1:
+                    raise ValueError(
+                        "Expected exactly one change summary row for "
+                        f"{trial_type} x {group}; found {len(summary_row)}."
+                    )
+                summary_row = summary_row.iloc[0]
+                x_position = positions[trial_type] + offsets[group]
+                mean_value = float(summary_row["mean_rt_change_ms"])
+                sem_value = float(summary_row["sem_rt_change_ms"])
+                pair_tops[trial_type].append(mean_value + sem_value)
+                plotted_values.extend([mean_value - sem_value, mean_value + sem_value])
+
+                ax.bar(
+                    x_position,
+                    mean_value,
+                    width=bar_width,
+                    color=colors[group],
+                    edgecolor="none",
+                    zorder=2,
+                    label=labels[group] if trial_type == trial_order[0] else None,
+                )
+                ax.errorbar(
+                    x_position,
+                    mean_value,
+                    yerr=sem_value,
+                    color="#303030",
+                    capsize=2.5,
+                    capthick=0.7,
+                    linewidth=0.7,
+                    zorder=3,
+                )
+
+                participant_values = change_scores[
+                    (change_scores["trial_type"] == trial_type)
+                    & (change_scores["group"] == group)
+                ]["rt_change_ms"].to_numpy()
+                jitter = rng.uniform(-0.045, 0.045, size=len(participant_values))
+                ax.scatter(
+                    np.full(len(participant_values), x_position) + jitter,
+                    participant_values,
+                    s=12,
+                    color=colors[group],
+                    edgecolor="white",
+                    linewidth=0.25,
+                    alpha=0.62,
+                    zorder=4,
+                )
+                plotted_values.extend(participant_values.tolist())
+
+        data_min, data_max = float(np.min(plotted_values)), float(np.max(plotted_values))
+        value_range = max(data_max - data_min, 1.0)
+        annotation_padding = max(0.07 * value_range, 10.0)
+        bracket_height = max(0.025 * value_range, 4.0)
+        annotation_tops = []
+        for trial_type in trial_order:
+            test_row = welch_tests[welch_tests["trial_type"] == trial_type]
+            if len(test_row) != 1:
+                raise ValueError(
+                    f"Expected one Welch-test row for {trial_type}; found {len(test_row)}."
+                )
+            y = max(pair_tops[trial_type]) + annotation_padding
+            x_left = positions[trial_type] + offsets["experimental"]
+            x_right = positions[trial_type] + offsets["control"]
+            ax.plot(
+                [x_left, x_left, x_right, x_right],
+                [y, y + bracket_height, y + bracket_height, y],
+                color="#303030",
+                linewidth=0.7,
+                clip_on=False,
+                zorder=5,
+            )
+            ax.text(
+                positions[trial_type],
+                y + bracket_height + 0.015 * value_range,
+                _significance_label(float(test_row.iloc[0]["p_value"])),
+                ha="center",
+                va="bottom",
+                fontsize=10,
+                color="#303030",
+                clip_on=False,
+            )
+            annotation_tops.append(y + bracket_height + 0.07 * value_range)
+
+        ax.axhline(0, color="#808080", linewidth=0.6, zorder=1)
+        ax.set_xticks([positions[trial_type] for trial_type in trial_order])
+        ax.set_xticklabels([trial_labels[trial_type] for trial_type in trial_order])
+        ax.set_title(
+            title,
+            pad=12,
+            fontweight="bold",
+        )
+        ax.set_ylabel("RT change (Post - Pre, ms)")
+        ax.set_xlim(-0.58, len(trial_order) - 0.42)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["bottom"].set_linewidth(0.6)
+        ax.spines["left"].set_linewidth(0.6)
+        ax.tick_params(axis="both", which="both", direction="out", length=3, width=0.6)
+        ax.legend(
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.13),
+            ncol=2,
+            frameon=False,
+            handlelength=1.1,
+            columnspacing=1.0,
+        )
+
+        y_min = min(data_min, 0.0) - max(0.10 * value_range, 12.0)
+        y_max = max(max(annotation_tops), data_max) + max(0.04 * value_range, 6.0)
+        ax.set_ylim(y_min, y_max)
+        fig.tight_layout(rect=[0, 0.08, 1, 1])
+
+    return fig
+
+
+def load_and_plot_training_rt_change_barplot(csv_path=None, save_figure=True):
+    """Load primary training RT data, summarize changes, and save the figure."""
+    if csv_path is None:
+        csv_path = PROJECT_ROOT / "analyses" / "all_subjects_training.csv"
+    csv_path = Path(csv_path)
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Consolidated training CSV not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+    print("TRAINING-TASK RT CHANGE FIGURE")
+    print(f"  Source CSV: {csv_path}")
+    print(f"  Raw rows x columns: {df.shape}")
+    results = summarize_training_rt_change_scores(df)
+    figure = plot_training_rt_change_barplot(
+        results["change_scores"],
+        results["change_summary"],
+        results["welch_tests"],
+    )
+
+    figure_path = None
+    png_path = None
+    if save_figure:
+        figure_path = _save_figure_pdf(figure, "behavioral_rt_change_barplot")
+        png_path = figure_path.with_suffix(".png")
+
+    results.update({
+        "source_csv": csv_path,
+        "figure": figure,
+        "figure_path": figure_path,
+        "png_path": png_path,
+    })
+    return results
+
+
+def summarize_stroop_rt_change_scores(df, tolerance_ms=1e-8):
+    """Compute validated post-minus-pre Stroop RT changes by congruency.
+
+    This reuses the exact Analysis 3 correct-trial inclusion, run-level pooled
+    +/-3 SD outlier filtering, and participant-session-condition aggregation.
+    Negative values indicate faster post-intervention reaction times.
+    """
+    _require_statistical_dependencies(require_scipy=True, require_statsmodels=False)
+
+    required_columns = {
+        "subject_id", "group", "session_id", "run_id", "trial_number",
+        "trial_type", "response", "reaction_time_ms",
+    }
+    missing_columns = sorted(required_columns - set(df.columns))
+    if missing_columns:
+        raise ValueError(
+            "Stroop RT change analysis is missing required columns: "
+            f"{missing_columns}"
+        )
+
+    source_sessions = set(pd.to_numeric(df["session_id"], errors="coerce").dropna().astype(int))
+    if source_sessions != {1, 5}:
+        raise ValueError(
+            "Stroop RT change analysis requires exactly Session IDs {1, 5}; "
+            f"found {sorted(source_sessions)}."
+        )
+    source_groups = set(df["group"].dropna().astype(str))
+    expected_groups = {"experimental", "control"}
+    if source_groups != expected_groups:
+        raise ValueError(
+            "Stroop RT change analysis requires group labels "
+            f"{sorted(expected_groups)}; found {sorted(source_groups)}."
+        )
+
+    # These are the same helpers invoked by analyze_stroop_reaction_time.
+    trial_data, warnings_list, incorrect_trial_summary = _prepare_stroop_reaction_time_data(df)
+    trial_data_clean, outlier_report = _remove_stroop_rt_outliers(trial_data)
+    primary_subject_session_summary = _aggregate_stroop_reaction_times(trial_data_clean)
+    subject_session_summary = primary_subject_session_summary[
+        primary_subject_session_summary["trial_type"].isin(["congruent", "incongruent"])
+    ].copy()
+
+    summary_keys = ["subject_id", "group", "session", "trial_type"]
+    if subject_session_summary.duplicated(summary_keys).any():
+        duplicate_rows = subject_session_summary.loc[
+            subject_session_summary.duplicated(summary_keys, keep=False), summary_keys
+        ]
+        raise ValueError(
+            "Duplicate subject/session/trial-type Stroop RT summary rows were found:\n"
+            f"{duplicate_rows.to_string(index=False)}"
+        )
+
+    expected_trial_types = {"congruent", "incongruent"}
+    observed_trial_types = set(subject_session_summary["trial_type"])
+    if observed_trial_types != expected_trial_types:
+        raise ValueError(
+            "Both congruent and incongruent Stroop RT summaries are required; "
+            f"found {sorted(observed_trial_types)}."
+        )
+
+    wide = subject_session_summary.pivot(
+        index=["subject_id", "group", "trial_type"],
+        columns="session",
+        values="mean_rt_ms",
+    ).reset_index()
+    missing_session_columns = {"pre", "post"} - set(wide.columns)
+    if missing_session_columns:
+        raise ValueError(
+            "Could not form both pre and post Stroop RT values for change scores; "
+            f"missing {sorted(missing_session_columns)}."
+        )
+    incomplete = wide[wide[["pre", "post"]].isna().any(axis=1)]
+    if not incomplete.empty:
+        raise ValueError(
+            "Every retained subject x Stroop trial type must have one pre and one post RT value. "
+            "Incomplete rows:\n"
+            f"{incomplete.to_string(index=False)}"
+        )
+
+    change_scores = wide.rename(columns={"pre": "pre_rt_ms", "post": "post_rt_ms"})
+    change_scores["rt_change_ms"] = (
+        change_scores["post_rt_ms"] - change_scores["pre_rt_ms"]
+    )
+    change_scores = change_scores.sort_values(
+        ["trial_type", "group", "subject_id"]
+    ).reset_index(drop=True)
+
+    expected_subject_counts = {
+        "experimental": len(BCI_GROUP_SUBJECTS),
+        "control": len(CONTROL_GROUP_SUBJECTS),
+    }
+    subject_counts = (
+        change_scores.groupby(["group", "trial_type"], observed=False)["subject_id"]
+        .nunique()
+        .reset_index(name="n_subjects")
+    )
+    subject_counts["expected_n_subjects"] = subject_counts["group"].map(
+        expected_subject_counts
+    )
+    subject_counts["matches_expected"] = (
+        subject_counts["n_subjects"] == subject_counts["expected_n_subjects"]
+    )
+
+    change_summary = (
+        change_scores.groupby(["trial_type", "group"], observed=False)["rt_change_ms"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+        .rename(columns={
+            "mean": "mean_rt_change_ms",
+            "std": "sd_rt_change_ms",
+            "count": "n_subjects",
+        })
+    )
+    change_summary["sem_rt_change_ms"] = (
+        change_summary["sd_rt_change_ms"] / np.sqrt(change_summary["n_subjects"])
+    )
+
+    # Reconstruct the endpoint difference from Analysis 3's exact participant
+    # summary, providing a direct check that the new change scores agree.
+    endpoint_means = (
+        subject_session_summary.groupby(
+            ["trial_type", "group", "session"], observed=False
+        )["mean_rt_ms"]
+        .mean()
+        .unstack("session")
+        .reset_index()
+    )
+    endpoint_means["expected_mean_rt_change_ms"] = (
+        endpoint_means["post"] - endpoint_means["pre"]
+    )
+    agreement = change_summary.merge(
+        endpoint_means[
+            ["trial_type", "group", "expected_mean_rt_change_ms"]
+        ],
+        on=["trial_type", "group"],
+        how="left",
+        validate="one_to_one",
+    )
+    agreement["difference_ms"] = (
+        agreement["mean_rt_change_ms"]
+        - agreement["expected_mean_rt_change_ms"]
+    )
+    agreement["within_tolerance"] = agreement["difference_ms"].abs() <= tolerance_ms
+    if not agreement["within_tolerance"].all():
+        raise RuntimeError(
+            "Stroop RT change-score means do not agree with the primary Analysis 3 "
+            "endpoint means within tolerance.\n"
+            f"{agreement.to_string(index=False)}"
+        )
+
+    welch_rows = []
+    for trial_type in ["congruent", "incongruent"]:
+        subset = change_scores[change_scores["trial_type"] == trial_type]
+        bci_values = subset.loc[
+            subset["group"] == "experimental", "rt_change_ms"
+        ].to_numpy()
+        control_values = subset.loc[
+            subset["group"] == "control", "rt_change_ms"
+        ].to_numpy()
+        if len(bci_values) < 2 or len(control_values) < 2:
+            raise ValueError(
+                f"Welch test for {trial_type} requires at least two participants per group."
+            )
+        statistic, p_value = stats.ttest_ind(
+            bci_values, control_values, equal_var=False
+        )
+        ci_low, ci_high = _welch_mean_difference_ci(bci_values, control_values)
+        welch_rows.append({
+            "trial_type": trial_type,
+            "comparison": "BCI - Mental Rehearsal RT change",
+            "n_bci": len(bci_values),
+            "n_mental_rehearsal": len(control_values),
+            "bci_mean_rt_change_ms": float(np.mean(bci_values)),
+            "mental_rehearsal_mean_rt_change_ms": float(np.mean(control_values)),
+            "estimate_ms": float(np.mean(bci_values) - np.mean(control_values)),
+            "statistic": statistic,
+            "df": _welch_df(bci_values, control_values),
+            "p_value": p_value,
+            "effect_size": _cohens_d_independent(bci_values, control_values),
+            "effect_size_label": "cohens_d",
+            "ci95_low_ms": ci_low,
+            "ci95_high_ms": ci_high,
+        })
+    welch_tests = pd.DataFrame(welch_rows)
+
+    print("STROOP RT CHANGE-SCORE SANITY CHECKS")
+    print(f"  Source rows: {len(df)}")
+    print(f"  Retained correct-trial RTs after run-level filtering: {len(trial_data_clean)}")
+    print("  Subject counts by group and congruency:")
+    print(subject_counts.to_string(index=False))
+    print("  Change-score agreement with primary Analysis 3 endpoint means:")
+    print(agreement.to_string(index=False))
+    print("  Welch BCI-versus-Mental-Rehearsal RT-change tests:")
+    print(welch_tests.to_string(index=False))
+    for row in welch_tests.itertuples(index=False):
+        print(
+            f"  {row.trial_type}: Welch t({row.df:.6f}) = {row.statistic:.6f}, "
+            f"p = {row.p_value:.12g}, Cohen's d = {row.effect_size:.6f}, "
+            f"BCI - Mental Rehearsal = {row.estimate_ms:.6f} ms"
+        )
+
+    return {
+        "trial_data_clean": trial_data_clean,
+        "incorrect_trial_summary": incorrect_trial_summary,
+        "outlier_report": outlier_report,
+        "primary_subject_session_summary": primary_subject_session_summary,
+        "subject_session_summary": subject_session_summary,
+        "change_scores": change_scores,
+        "change_summary": change_summary,
+        "welch_tests": welch_tests,
+        "subject_counts": subject_counts,
+        "agreement_with_primary_analysis3": agreement,
+        "warnings": warnings_list,
+    }
+
+
+def plot_stroop_rt_change_barplot(change_scores, change_summary, welch_tests):
+    """Plot poster-style Stroop post-minus-pre RT changes by congruency."""
+    return plot_training_rt_change_barplot(
+        change_scores,
+        change_summary,
+        welch_tests,
+        trial_order=("congruent", "incongruent"),
+        trial_labels={"congruent": "Congruent", "incongruent": "Incongruent"},
+        title="Stroop Task Post-Pre RT Change",
+    )
+
+
+def load_and_plot_stroop_rt_change_barplot(csv_path=None, save_figure=True):
+    """Load primary Stroop RT data, summarize changes, and save the figure."""
+    if csv_path is None:
+        csv_path = PROJECT_ROOT / "analyses" / "all_subjects_stroop.csv"
+    csv_path = Path(csv_path)
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Consolidated Stroop CSV not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+    print("STROOP RT CHANGE FIGURE")
+    print(f"  Source CSV: {csv_path}")
+    print(f"  Raw rows x columns: {df.shape}")
+    results = summarize_stroop_rt_change_scores(df)
+    figure = plot_stroop_rt_change_barplot(
+        results["change_scores"],
+        results["change_summary"],
+        results["welch_tests"],
+    )
+
+    figure_path = None
+    png_path = None
+    if save_figure:
+        figure_path = _save_figure_pdf(figure, "stroop_rt_change_barplot")
+        png_path = figure_path.with_suffix(".png")
+
+    results.update({
+        "source_csv": csv_path,
+        "figure": figure,
+        "figure_path": figure_path,
+        "png_path": png_path,
+    })
+    return results
+
+
 def analyze_accuracy_and_timeout(summary_df):
     """ANALYSIS 2: Compute accuracy and timeout metrics with plots and statistics.
 
@@ -3902,8 +4604,8 @@ def _set_y_limits_with_padding(ax, values, pad_fraction=0.08, min_pad=0.002):
 def _publication_style_rcparams():
     """Return matplotlib rcParams for publication-style behavioral figures."""
     return {
-        "font.family": "sans-serif",
-        "font.sans-serif": ["Arial"],
+        "font.family": "Times New Roman",
+        "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
         "font.size": 8,
         "axes.linewidth": 0.5,
         "xtick.major.width": 0.5,
