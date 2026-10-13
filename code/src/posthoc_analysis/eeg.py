@@ -41,6 +41,11 @@ TRAINING_CONDITION_ORDER = (
 TRAINING_CONDITION_EEG_AVERAGES_FILENAME = "training_session_condition_eeg_averages.csv"
 DEFAULT_PD_PLOT_TIME_WINDOW = (-0.2, 0.7)
 DEFAULT_PD_DECODER_TIME_WINDOW = (0.2, 0.5)
+POSTER_PD_FIGURE_SIZE_CM = (12.46, 13.01)
+POSTER_PD_SESSION_COLORS = {
+    "bci": {1: "#F4A261", 5: "#C65D28"},
+    "control": {1: "#3182BD", 5: "#08306B"},
+}
 DEFAULT_PD_AUC_OUTPUT_FILENAME = "training_pd_positive_auc_0p2_0p5.csv"
 DEFAULT_PD_NEGATIVE_AUC_OUTPUT_FILENAME = "training_pd_negative_auc_0p5_0p9.csv"
 DEFAULT_PD_MEAN_AMPLITUDE_OUTPUT_FILENAME = "training_pd_mean_amplitude_0p5_0p9.csv"
@@ -1690,12 +1695,17 @@ def plot_group_pd_pre_post(
     decoder_window=DEFAULT_PD_DECODER_TIME_WINDOW,
     session_labels=None,
     colors=None,
-    figsize=(4.2, 4.2),
+    figure_size_cm=POSTER_PD_FIGURE_SIZE_CM,
     y_limits=(-1.5, 1.5),
     session_rt_sec=None,
     ax=None,
 ):
-    """Plot Session 1 vs Session 5 group-average Pd with subject SEM shading."""
+    """Plot Session 1 vs Session 5 group-average Pd with subject SEM shading.
+
+    The default canvas and typography follow the project poster profile. BCI
+    uses orange session hues and mental rehearsal uses blue session hues, with
+    Session 1 shown in the lighter hue and Session 5 in the darker hue.
+    """
     _prepare_plot_environment()
     import matplotlib.pyplot as plt
 
@@ -1713,79 +1723,115 @@ def plot_group_pd_pre_post(
         raise ValueError(f"group_pd_summary is missing columns: {missing_columns}")
 
     group = str(group).lower().strip()
+    if group not in {"bci", "control"}:
+        raise ValueError(
+            "group must be 'bci' or 'control' for the poster Pd figure; "
+            f"got {group!r}."
+        )
     if group_label is None:
         group_label = {"bci": "BCI", "control": "Mental rehearsal"}.get(group, group)
     if session_labels is None:
         session_labels = {1: "Session 1", 5: "Session 5"}
     if colors is None:
-        colors = {1: "#4C72B0", 5: "#DD8452"}
+        colors = POSTER_PD_SESSION_COLORS[group].copy()
+    missing_colors = sorted({1, 5} - set(colors))
+    if missing_colors:
+        raise ValueError(f"colors is missing session IDs: {missing_colors}")
+    if len(figure_size_cm) != 2 or any(not np.isfinite(value) or value <= 0 for value in figure_size_cm):
+        raise ValueError(
+            "figure_size_cm must contain positive (width, height) values; "
+            f"got {figure_size_cm!r}."
+        )
+    figsize = tuple(float(value) / 2.54 for value in figure_size_cm)
+
+    poster_rc_params = {
+        "font.family": "Times New Roman",
+        "font.size": 10,
+        "axes.titlesize": 15,
+        "axes.labelsize": 12,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "legend.fontsize": 10,
+        "axes.linewidth": 0.6,
+        "xtick.major.width": 0.6,
+        "ytick.major.width": 0.6,
+        "xtick.direction": "out",
+        "ytick.direction": "out",
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    }
 
     fig = None
-    if ax is None:
-        fig, ax = plt.subplots(figsize=figsize)
-    else:
-        fig = ax.figure
+    with plt.rc_context(poster_rc_params):
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig = ax.figure
 
-    subset = group_pd_summary[group_pd_summary["group"].str.lower() == group].copy()
-    if subset.empty:
-        raise ValueError(f"No Pd summary rows found for group {group!r}.")
-    subset = subset[
-        (subset["time_sec"] >= time_window[0])
-        & (subset["time_sec"] <= time_window[1])
-    ].sort_values(["session_id", "sample_index"])
-    if subset.empty:
-        raise ValueError(f"No Pd samples found in time window {time_window}.")
+        subset = group_pd_summary[group_pd_summary["group"].str.lower() == group].copy()
+        if subset.empty:
+            raise ValueError(f"No Pd summary rows found for group {group!r}.")
+        subset = subset[
+            (subset["time_sec"] >= time_window[0])
+            & (subset["time_sec"] <= time_window[1])
+        ].sort_values(["session_id", "sample_index"])
+        if subset.empty:
+            raise ValueError(f"No Pd samples found in time window {time_window}.")
 
-    for session_id in (1, 5):
-        session_df = subset[subset["session_id"] == session_id].sort_values("time_sec")
-        if session_df.empty:
-            raise ValueError(f"No Pd rows for group {group}, session {session_id}.")
-        time = session_df["time_sec"].to_numpy()
-        mean = session_df["mean_pd_uv"].to_numpy()
-        sem = session_df["sem_pd_uv"].to_numpy()
-        color = colors[session_id]
-        label = session_labels.get(session_id, f"Session {session_id}")
-        ax.plot(time, mean, color=color, linewidth=1.8, label=label)
-        ax.fill_between(time, mean - sem, mean + sem, color=color, alpha=0.22, linewidth=0)
+        for session_id in (1, 5):
+            session_df = subset[subset["session_id"] == session_id].sort_values("time_sec")
+            if session_df.empty:
+                raise ValueError(f"No Pd rows for group {group}, session {session_id}.")
+            time = session_df["time_sec"].to_numpy()
+            mean = session_df["mean_pd_uv"].to_numpy()
+            sem = session_df["sem_pd_uv"].to_numpy()
+            color = colors[session_id]
+            label = session_labels.get(session_id, f"Session {session_id}")
+            ax.plot(time, mean, color=color, linewidth=1.8, label=label)
+            ax.fill_between(time, mean - sem, mean + sem, color=color, alpha=0.22, linewidth=0)
 
-    if session_rt_sec is not None:
-        for session_id, rt_sec in session_rt_sec.items():
-            if rt_sec is None or not np.isfinite(rt_sec):
-                continue
-            if time_window[0] <= rt_sec <= time_window[1]:
-                ax.axvline(
-                    rt_sec,
-                    color=colors[int(session_id)],
-                    linestyle=":",
-                    linewidth=1.1,
-                    alpha=0.95,
-                )
+        if session_rt_sec is not None:
+            for session_id, rt_sec in session_rt_sec.items():
+                if rt_sec is None or not np.isfinite(rt_sec):
+                    continue
+                if time_window[0] <= rt_sec <= time_window[1]:
+                    ax.axvline(
+                        rt_sec,
+                        color=colors[int(session_id)],
+                        linestyle=":",
+                        linewidth=1.1,
+                        alpha=0.95,
+                    )
 
-    ax.axvspan(
-        decoder_window[0],
-        decoder_window[1],
-        color="0.85",
-        alpha=0.55,
-        linewidth=0,
-        zorder=0,
-    )
-    ax.axvline(0, color="0.2", linestyle="--", linewidth=0.8)
-    ax.axhline(0, color="0.75", linewidth=0.8)
-    ax.set_xlim(time_window)
-    if y_limits is not None:
-        if y_limits[0] >= y_limits[1]:
-            raise ValueError(f"y_limits must be increasing, got {y_limits}.")
-        ax.set_ylim(y_limits)
-    xticks = np.arange(time_window[0], time_window[1] + 1e-9, 0.2)
-    ax.set_xticks(xticks)
-    ax.set_xticklabels([f"{tick:.1f}" for tick in xticks])
-    ax.set_xlabel("Time from stimulus onset (s)")
-    ax.set_ylabel("Pd amplitude (microvolts)")
-    ax.set_title(f"{group_label}: Pd pre vs post")
-    ax.legend(frameon=False, loc="best")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    fig.tight_layout()
+        ax.axvspan(
+            decoder_window[0],
+            decoder_window[1],
+            color="0.85",
+            alpha=0.55,
+            linewidth=0,
+            zorder=0,
+        )
+        ax.axvline(0, color="0.2", linestyle="--", linewidth=0.8)
+        ax.axhline(0, color="0.75", linewidth=0.8)
+        ax.set_xlim(time_window)
+        if y_limits is not None:
+            if y_limits[0] >= y_limits[1]:
+                raise ValueError(f"y_limits must be increasing, got {y_limits}.")
+            ax.set_ylim(y_limits)
+        xticks = np.arange(time_window[0], time_window[1] + 1e-9, 0.2)
+        ax.set_xticks(xticks)
+        ax.set_xticklabels([f"{tick:.1f}" for tick in xticks])
+        ax.set_xlabel("Time from stimulus onset (s)")
+        ax.set_ylabel("Pd amplitude (microvolts)")
+        ax.set_title(f"{group_label}: Pd pre vs post", pad=12, fontweight="bold")
+        ax.legend(frameon=False, loc="best", handlelength=1.1)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["bottom"].set_linewidth(0.6)
+        ax.spines["left"].set_linewidth(0.6)
+        ax.tick_params(axis="both", which="both", direction="out", length=3, width=0.6)
+        fig.tight_layout(pad=1.2)
+        fig.subplots_adjust(top=0.93)
 
     plotted_subjects = (
         group_pd_summary[group_pd_summary["group"].str.lower() == group]
@@ -1797,7 +1843,8 @@ def plot_group_pd_pre_post(
         f"Plotted {group_label} Pd pre/post over {time_window[0]:g} to "
         f"{time_window[1]:g} s; decoder window shaded "
         f"{decoder_window[0]:g} to {decoder_window[1]:g} s. "
-        f"Subjects/session: {plotted_subjects}"
+        f"Subjects/session: {plotted_subjects}. Poster canvas: "
+        f"{figure_size_cm[0]:g} cm wide x {figure_size_cm[1]:g} cm high."
     )
     return fig, ax
 
@@ -2228,8 +2275,13 @@ def load_and_plot_group_pd_pre_post_from_condition_csv(
     output_dir=None,
     save_figures=True,
     figure_formats=("pdf", "png"),
+    figure_size_cm=POSTER_PD_FIGURE_SIZE_CM,
 ):
-    """Load condition-average EEG CSV and plot Pd pre/post for each group."""
+    """Load condition-average EEG CSV and make poster-format Pd figures.
+
+    ``figure_size_cm`` is (width, height) in centimetres and is applied to
+    both group figures so their poster placement is directly comparable.
+    """
     csv_path = resolve_training_condition_eeg_averages_csv(csv_path=csv_path)
     subject_session_pd = compute_subject_session_pd_from_condition_averages(csv_path=csv_path)
     group_pd_summary = summarize_group_pd_pre_post(subject_session_pd)
@@ -2250,13 +2302,16 @@ def load_and_plot_group_pd_pre_post_from_condition_csv(
             group_pd_summary=group_pd_summary,
             group=group,
             group_label=label,
+            figure_size_cm=figure_size_cm,
         )
         figures[group] = fig
         axes[group] = ax
         if save_figures:
             for figure_format in figure_formats:
                 path = output_dir / f"{stem}.{figure_format}"
-                fig.savefig(path, dpi=300, bbox_inches="tight")
+                # Preserve the requested poster canvas dimensions in the final
+                # PDF/PNG rather than trimming its physical page bounds.
+                fig.savefig(path, dpi=300)
                 saved_paths.append(path)
                 print(f"Saved figure: {path}")
 
