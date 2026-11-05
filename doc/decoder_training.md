@@ -205,6 +205,20 @@ evaluation run only. Longitudinal statistics should use the available
 subject-session values in a mixed-effects model; do not impute a missing EEG
 run or silently convert a partial session into a complete one.
 
+The frozen-feature evaluation retains the established online-aligned run policy:
+when e22 and e37 have seven Session-5 decoding folders, the first folder is
+excluded as practice-like and the six remaining runs are used. This is distinct
+from the separately approved seven-point sensor-Pd trajectory, which retains all
+seven folders. The manifest records these exclusions explicitly. Do not compare
+these analysis populations as though they contain identical runs.
+
+Frozen-reference loading validates the version and participant/side identity,
+finite 2-by-7 xDAWN matrix, conventional channel order, the 768-sample epoch at
+512 Hz, 200-ms-to-final-sample feature window, stride 8, finite training-only
+normalization, and 30 unique in-range indices. The ranked coordinate table must
+agree exactly with the saved indices. These checks reject corrupt inputs before
+cache reuse or inference; they do not refit or modify a saved transform.
+
 The validated e29 evaluation inventory includes one documented extra fixation
 Status marker eight samples after a stimulus. Because all 60 stimulus anchors
 and their conditions remain intact, it is retained under a narrow explicit QC

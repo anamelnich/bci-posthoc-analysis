@@ -525,18 +525,76 @@ def validate_stroop_accuracy_summary(summary_df, original_df):
     }
 
 
+def summarize_stroop_accuracy(df):
+    """Validate non-practice trials and summarize correct/(correct+incorrect).
+
+    Preserve the existing accuracy definition: exclude only timeout responses,
+    with no latency cutoff or SD-based RT filter. Runs are pooled by trial
+    counts within participant x session x congruency, not averaged as ratios.
+    Return condition and overall summaries, exclusions, descriptive 95% CIs,
+    and validated original trials. No figures or files are generated.
+    """
+    _require_statistical_dependencies(require_scipy=True, require_statsmodels=False)
+    data, warnings_list = _prepare_stroop_behavioral_data(df)
+    summary = create_stroop_accuracy_summary_table(data)
+    validation = validate_stroop_accuracy_summary(summary, data)
+    if not validation["valid"]:
+        raise ValueError("Invalid Stroop accuracy summary: " + "; ".join(validation["issues"]))
+    conditions = summary.loc[summary.trial_type.isin(["congruent", "incongruent"])].copy()
+    conditions["n_accuracy_trials"] = conditions.n_correct + conditions.n_incorrect
+    if not (conditions.n_accuracy_trials + conditions.n_timeouts).eq(conditions.n_total_trials).all():
+        raise RuntimeError("Stroop accuracy counts do not reconcile with trial totals.")
+    if conditions.n_total_trials.sum() != len(data):
+        raise RuntimeError("Stroop condition summaries do not account for every input trial.")
+    cell_summary = conditions.groupby(["group", "session", "trial_type"], observed=True).accuracy.agg(
+        mean="mean", std="std", n_subjects="count").reset_index()
+    cell_summary["sem"] = cell_summary["std"] / np.sqrt(cell_summary.n_subjects)
+    margin = stats.t.ppf(.975, cell_summary.n_subjects - 1) * cell_summary["sem"]
+    cell_summary["ci95_low"] = cell_summary["mean"] - margin
+    cell_summary["ci95_high"] = cell_summary["mean"] + margin
+    print(f"Validated {len(conditions)} participant/session/congruency accuracies; "
+          f"{int(conditions.n_correct.sum())} correct, {int(conditions.n_incorrect.sum())} incorrect, "
+          f"{int(conditions.n_timeouts.sum())} timeouts excluded.")
+    print("Accuracy = correct/(correct+incorrect); no RT cutoff or RT-outlier exclusions.")
+    print(cell_summary.to_string(index=False))
+    return {"summary_table": summary, "subject_session_summary": conditions,
+            "exclusion_report": conditions.drop(columns="accuracy"),
+            "cell_summary": cell_summary, "trial_data": data,
+            "validation": validation, "warnings": warnings_list}
+
+
+def analyze_stroop_accuracy_mixed_anova(df):
+    """Validate unchanged Stroop accuracy counts and report the joint mixed ANOVA."""
+    results = summarize_stroop_accuracy(df)
+    results["stats_anova"] = run_stroop_accuracy_mixed_anova(results["subject_session_summary"])
+    print("Stroop accuracy analysis complete: validated counts and seven mixed-ANOVA effects.")
+    return results
+
+
+def run_stroop_accuracy_mixed_anova(summary_df):
+    """Test Group x Session x Congruency on four accuracies per participant.
+
+    Pass only congruent/incongruent rows, without overall rows. The shared
+    engine validates complete, balanced groups and finite accuracies in [0,1],
+    and prints all seven tests using their corresponding participant errors.
+    """
+    return _run_behavioral_2x2x2_mixed_anova(
+        summary_df, "accuracy", "ACCURACY", condition_levels=("congruent", "incongruent"),
+        condition_label="Congruency", task_label="STROOP")
+
+
 def analyze_stroop_accuracy(df):
-    """ANALYSIS 2: Compute Stroop accuracy summaries, plots, and statistics."""
+    """Compute unchanged Stroop accuracy/plots and the joint mixed ANOVA.
+
+    The statistics dictionary now contains ``mixed`` (all seven effects),
+    replacing the historical separate congruent/incongruent/overall OLS tests.
+    """
     print("=" * 80)
     print("STROOP ANALYSIS 2: ACCURACY")
     print("=" * 80)
 
-    data, warnings_list = _prepare_stroop_accuracy_data(df)
-    summary_table = create_stroop_accuracy_summary_table(data)
-    validation = validate_stroop_accuracy_summary(summary_table, data)
-    if not validation["valid"]:
-        for issue in validation["issues"]:
-            _print_warning(issue)
+    results = analyze_stroop_accuracy_mixed_anova(df)
+    summary_table = results["summary_table"]
 
     _print_stroop_accuracy_checks(summary_table)
 
@@ -544,29 +602,7 @@ def analyze_stroop_accuracy(df):
     incongruent_accuracy = summary_table[summary_table["trial_type"] == "incongruent"].copy()
     overall_accuracy = summary_table[summary_table["trial_type"] == "overall"].copy()
 
-    stats_results = {}
-    if ols is None or anova_lm is None:
-        warning = (
-            "Statsmodels/SciPy are unavailable in the current environment, so "
-            "Stroop accuracy ANOVAs were not executed. Summary tables and figures "
-            "were still generated."
-        )
-        warnings_list.append(warning)
-        _print_warning(warning)
-        stats_results = {
-            "congruent": None,
-            "incongruent": None,
-            "overall": None,
-        }
-    else:
-        print("\n" + "=" * 80)
-        print("STATISTICAL ANALYSES")
-        print("=" * 80)
-        stats_results = {
-            "congruent": _run_stroop_accuracy_anova(congruent_accuracy, "congruent"),
-            "incongruent": _run_stroop_accuracy_anova(incongruent_accuracy, "incongruent"),
-            "overall": _run_stroop_accuracy_anova(overall_accuracy, "overall"),
-        }
+    stats_results = {"mixed": results["stats_anova"]}
 
     print("\n" + "=" * 80)
     print("GENERATING FIGURES")
@@ -582,13 +618,14 @@ def analyze_stroop_accuracy(df):
 
     return {
         "summary_table": summary_table,
-        "validation": validation,
+        "validation": results["validation"],
         "congruent_accuracy": congruent_accuracy,
         "incongruent_accuracy": incongruent_accuracy,
         "overall_accuracy": overall_accuracy,
         "stats": stats_results,
+        "stats_anova": results["stats_anova"],
         "figures": figures,
-        "warnings": warnings_list,
+        "warnings": results["warnings"],
     }
 
 
@@ -607,12 +644,14 @@ def load_and_analyze_stroop_accuracy_data(csv_path=None):
     return results
 
 
-def analyze_stroop_reaction_time(df):
-    """ANALYSIS 3: Compute Stroop reaction-time summaries, plots, and statistics."""
-    print("=" * 80)
-    print("STROOP ANALYSIS 3: REACTION TIME")
-    print("=" * 80)
+def summarize_stroop_reaction_time(df):
+    """Validate and clean Stroop RTs, reporting disjoint exclusions on all trials.
 
+    Pool correct trials across runs and congruency within participant/session
+    for one +/-3 sample-SD pass. Return reusable cleaned trials, participant
+    means, threshold diagnostics, and total timeout/incorrect/SD exclusions.
+    No statistics, figures, or source-file changes are performed here.
+    """
     data, warnings_list, incorrect_trial_summary = _prepare_stroop_reaction_time_data(df)
     trial_data_clean, outlier_report = _remove_stroop_rt_outliers(data)
     subject_exclusion_summary = _summarize_stroop_rt_exclusions_by_subject(
@@ -623,6 +662,54 @@ def analyze_stroop_reaction_time(df):
         subject_exclusion_summary
     )
     subject_session_summary = _aggregate_stroop_reaction_times(trial_data_clean)
+
+    n_total = incorrect_trial_summary["n_total_trials"]
+    n_timeout = incorrect_trial_summary["n_timeout_trials"]
+    n_incorrect = incorrect_trial_summary["n_incorrect_trials"]
+    n_sd = int(outlier_report.n_outliers_removed.sum())
+    n_retained = len(trial_data_clean)
+    if n_total != n_timeout + n_incorrect + n_sd + n_retained:
+        raise RuntimeError("Stroop RT counts do not reconcile: timeout + incorrect + SD + retained != all trials.")
+    breakdown = pd.DataFrame({
+        "category": ["Timeout", "Incorrect", "RT outside +/-3 SD", "Total removed", "Retained"],
+        "n_trials": [n_timeout, n_incorrect, n_sd, n_total - n_retained, n_retained],
+    })
+    breakdown["percent_of_all_trials"] = 100 * breakdown.n_trials / n_total
+    print(f"Stroop RT sequential exclusions (denominator: all {n_total} non-practice trials):")
+    print(breakdown.to_string(index=False))
+    return {
+        "trial_data_before_outlier_removal": data, "trial_data_clean": trial_data_clean,
+        "incorrect_trial_summary": incorrect_trial_summary, "outlier_report": outlier_report,
+        "subject_exclusion_summary": subject_exclusion_summary,
+        "overall_exclusion_summary": overall_exclusion_summary,
+        "subject_session_summary": subject_session_summary,
+        "exclusion_breakdown": breakdown,
+        "n_total_trials": n_total, "n_retained_trials": n_retained,
+        "n_removed_total": n_total - n_retained,
+        "percent_removed_total": 100 * (n_total - n_retained) / n_total,
+        "warnings": warnings_list,
+    }
+
+
+def analyze_stroop_reaction_time(df):
+    """Compute pooled-session-cleaned Stroop RTs, plots, and the joint mixed ANOVA.
+
+    ``stats['mixed']`` replaces the historical separate congruent, incongruent,
+    and overall OLS tests. Overall RT remains a descriptive summary.
+    """
+    print("=" * 80)
+    print("STROOP ANALYSIS 3: REACTION TIME")
+    print("=" * 80)
+
+    results = summarize_stroop_reaction_time(df)
+    data = results["trial_data_before_outlier_removal"]
+    trial_data_clean = results["trial_data_clean"]
+    incorrect_trial_summary = results["incorrect_trial_summary"]
+    outlier_report = results["outlier_report"]
+    subject_exclusion_summary = results["subject_exclusion_summary"]
+    overall_exclusion_summary = results["overall_exclusion_summary"]
+    subject_session_summary = results["subject_session_summary"]
+    warnings_list = results["warnings"]
 
     _print_stroop_reaction_time_checks(
         data,
@@ -644,28 +731,11 @@ def analyze_stroop_reaction_time(df):
         subject_session_summary["trial_type"] == "overall"
     ].copy()
 
-    if ols is None or anova_lm is None or stats is None:
-        warning = (
-            "Statsmodels/SciPy are unavailable in the current environment, so "
-            "Stroop RT ANOVAs were not executed. Summary tables and figures were "
-            "still generated."
-        )
-        warnings_list.append(warning)
-        _print_warning(warning)
-        stats_results = {
-            "congruent": None,
-            "incongruent": None,
-            "overall": None,
-        }
-    else:
-        print("\n" + "=" * 80)
-        print("STATISTICAL ANALYSES")
-        print("=" * 80)
-        stats_results = {
-            "congruent": _run_stroop_rt_anova(congruent_rt, "congruent"),
-            "incongruent": _run_stroop_rt_anova(incongruent_rt, "incongruent"),
-            "overall": _run_stroop_rt_anova(overall_rt, "overall"),
-        }
+    condition_summary = subject_session_summary.loc[
+        subject_session_summary.trial_type.isin(["congruent", "incongruent"])
+    ].copy()
+    stats_anova = run_stroop_rt_mixed_anova(condition_summary)
+    stats_results = {"mixed": stats_anova}
 
     print("\n" + "=" * 80)
     print("GENERATING FIGURES")
@@ -676,6 +746,7 @@ def analyze_stroop_reaction_time(df):
     print("=" * 80)
 
     return {
+        **results,
         "trial_data_before_outlier_removal": data,
         "trial_data_clean": trial_data_clean,
         "incorrect_trial_summary": incorrect_trial_summary,
@@ -687,6 +758,8 @@ def analyze_stroop_reaction_time(df):
         "incongruent_rt": incongruent_rt,
         "overall_rt": overall_rt,
         "stats": stats_results,
+        "stats_anova": stats_anova,
+        "cell_summary": stats_anova["cell_summary"],
         "figures": figures,
         "warnings": warnings_list,
     }
@@ -1091,8 +1164,10 @@ def _print_stroop_timeout_checks(
     print(overall_summary["by_group_session"].to_string(index=False))
 
 
-def _prepare_stroop_accuracy_data(df):
-    """Validate and prepare Stroop trial-level data for accuracy analysis."""
+def _prepare_stroop_behavioral_data(df):
+    """Validate non-practice Stroop trials before accuracy or RT selection."""
+    from .consolidated import STROOP_BEHOUTPUT_COLUMNS, validate_stroop_behoutput
+
     required_columns = {
         "subject_id",
         "group",
@@ -1101,16 +1176,55 @@ def _prepare_stroop_accuracy_data(df):
         "trial_number",
         "trial_type",
         "response",
+        "stimulus",
+        "ink_color",
+        "reaction_time_ms",
     }
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise ValueError("Stroop analysis requires a nonempty trial-level DataFrame.")
     missing_columns = sorted(required_columns - set(df.columns))
     if missing_columns:
         raise ValueError(
-            "Stroop accuracy analysis is missing required columns: "
+            "Stroop analysis is missing required columns: "
             f"{missing_columns}"
         )
 
     data = df.copy()
     warnings_list = []
+    if "task_type" in data:
+        keep = data.task_type.eq("stroop")
+        print(f"Non-Stroop/practice rows excluded: {int((~keep).sum())}.")
+        data = data.loc[keep].copy()
+    if data.empty:
+        raise ValueError("No non-practice Stroop trials remain.")
+    identifiers = ["subject_id", "group", "session_id", "run_id", "trial_number"]
+    if data[identifiers].isna().any().any():
+        raise ValueError("Stroop trial identifiers/group labels must be nonmissing.")
+    for column in ["session_id", "run_id", "trial_number", "response", "reaction_time_ms"]:
+        data[column] = pd.to_numeric(data[column], errors="raise")
+    if not data.session_id.isin([1, 5]).all() or not data.run_id.isin([1, 2]).all():
+        raise ValueError("Stroop analysis requires sessions 1/5 and non-practice run IDs 1/2.")
+    expected_groups = {**dict.fromkeys(BCI_GROUP_SUBJECTS, "experimental"),
+                       **dict.fromkeys(CONTROL_GROUP_SUBJECTS, "control")}
+    if not data.group.eq(data.subject_id.map(expected_groups)).all():
+        raise ValueError("Stroop subject/group assignments disagree with the configured roster.")
+    keys = ["subject_id", "session_id", "run_id", "trial_number"]
+    if data.duplicated(keys).any():
+        raise ValueError("Duplicate Stroop participant/session/run/trial identifiers.")
+    if not np.isfinite(data.reaction_time_ms.dropna()).all():
+        raise ValueError("Stroop reaction times must be finite when present.")
+    data["trial_type"] = data["trial_type"].astype(str).str.lower().str.strip()
+    run_keys = ["subject_id", "session_id", "run_id"]
+    for run_key, run in data.groupby(run_keys, observed=True):
+        validate_stroop_behoutput(
+            run.sort_values("trial_number")[STROOP_BEHOUTPUT_COLUMNS], filepath=str(run_key))
+    run_counts = data.groupby(["subject_id", "session_id"], observed=True).run_id.nunique()
+    incomplete = run_counts[run_counts.ne(2)]
+    if not incomplete.empty:
+        warning = f"Expected two Stroop runs per session; retaining available complete runs: {incomplete.to_dict()}"
+        warnings_list.append(warning)
+        _print_warning(warning)
+    print(f"Validated {len(data)} Stroop trials across {data.groupby(run_keys).ngroups} complete 60-trial runs.")
 
     subject_count = int(data["subject_id"].nunique())
     if subject_count != 32:
@@ -1122,26 +1236,10 @@ def _prepare_stroop_accuracy_data(df):
         _print_warning(warning)
 
     data["session"] = data["session_id"].map({1: "pre", 5: "post"})
-    data["trial_type"] = data["trial_type"].astype(str).str.lower().str.strip()
-
-    invalid_trial_types = sorted(
-        set(data["trial_type"].dropna()) - {"congruent", "incongruent"}
-    )
-    if invalid_trial_types:
-        warning = f"Found unexpected Stroop trial types: {invalid_trial_types}"
-        warnings_list.append(warning)
-        _print_warning(warning)
-
-    invalid_responses = sorted(set(data["response"].dropna()) - {1, 2, 3})
-    if invalid_responses:
-        warning = f"Found unexpected Stroop response codes: {invalid_responses}"
-        warnings_list.append(warning)
-        _print_warning(warning)
-
     timeout_count = int((data["response"] == 3).sum())
-    print("\nStroop accuracy-analysis input summary:")
+    print("\nStroop behavioral input summary:")
     print(f"Total rows: {len(data)}")
-    print(f"Timeout rows excluded from accuracy denominator: {timeout_count}")
+    print(f"Timeout rows (excluded from accuracy and RT): {timeout_count}")
 
     return data, warnings_list
 
@@ -1174,29 +1272,10 @@ def _print_stroop_accuracy_checks(summary_table):
 
 
 def _run_stroop_accuracy_anova(summary_df, label):
-    """Run a subject-adjusted two-factor ANOVA on Stroop accuracy."""
-    anova_data = summary_df.copy()
-    formula = "accuracy ~ C(subject_id) + C(session) * C(group)"
-    model = ols(formula, data=anova_data).fit()
-    anova_table = anova_lm(model, typ=2)
-
-    residual_ss = anova_table.loc["Residual", "sum_sq"]
-    anova_report = anova_table.reset_index().rename(columns={"index": "effect"})
-    anova_report["partial_eta_sq"] = np.where(
-        anova_report["effect"] != "Residual",
-        anova_report["sum_sq"] / (anova_report["sum_sq"] + residual_ss),
-        np.nan,
+    """Legacy condition-specific entry point with valid participant error strata."""
+    return run_behavioral_prepost_mixed_anova(
+        summary_df, value_col="accuracy", outcome_label=f"Stroop {label} accuracy",
     )
-
-    print(f"\n--- {label.title()} Accuracy: 2-Way ANOVA (Time × Group) ---")
-    print(anova_report.to_string(index=False))
-
-    return {
-        "model": model,
-        "anova_table": anova_table,
-        "anova_report": anova_report,
-        "r_squared": model.rsquared,
-    }
 
 
 def _plot_stroop_accuracy_figures(
@@ -1320,56 +1399,14 @@ def _plot_stroop_accuracy_panel(data, title, y_label, filename_stem):
 
 def _prepare_stroop_reaction_time_data(df):
     """Validate and prepare Stroop trial-level data for RT analysis."""
-    required_columns = {
-        "subject_id",
-        "group",
-        "session_id",
-        "run_id",
-        "trial_number",
-        "trial_type",
-        "response",
-        "reaction_time_ms",
-    }
-    missing_columns = sorted(required_columns - set(df.columns))
-    if missing_columns:
-        raise ValueError(
-            "Stroop RT analysis is missing required columns: "
-            f"{missing_columns}"
-        )
-
-    data = df.copy()
-    warnings_list = []
-    data["session"] = data["session_id"].map({1: "pre", 5: "post"})
-    data["trial_type"] = data["trial_type"].astype(str).str.lower().str.strip()
-
-    subject_count = int(data["subject_id"].nunique())
-    if subject_count != 32:
-        warning = (
-            f"Consolidated Stroop CSV contains {subject_count} subjects rather "
-            "than the full 32-subject study roster. Proceeding with available data."
-        )
-        warnings_list.append(warning)
-        _print_warning(warning)
-
-    invalid_trial_types = sorted(
-        set(data["trial_type"].dropna()) - {"congruent", "incongruent"}
-    )
-    if invalid_trial_types:
-        warning = f"Found unexpected Stroop trial types: {invalid_trial_types}"
-        warnings_list.append(warning)
-        _print_warning(warning)
-
-    invalid_responses = sorted(set(data["response"].dropna()) - {1, 2, 3})
-    if invalid_responses:
-        warning = f"Found unexpected Stroop response codes: {invalid_responses}"
-        warnings_list.append(warning)
-        _print_warning(warning)
+    data, warnings_list = _prepare_stroop_behavioral_data(df)
 
     incorrect_trials = int((data["response"] == 2).sum())
     total_trials = int(len(data))
     incorrect_trial_summary = {
         "n_total_trials": total_trials,
         "n_incorrect_trials": incorrect_trials,
+        "n_timeout_trials": int(data["response"].eq(3).sum()),
         "percent_incorrect_trials": incorrect_trials / total_trials * 100.0,
     }
 
@@ -1392,59 +1429,57 @@ def _prepare_stroop_reaction_time_data(df):
 
 
 def _remove_stroop_rt_outliers(trial_data):
-    """Remove Stroop RT outliers using mean +/- 3 SD within each run."""
-    grouped = (
-        trial_data
-        .groupby(
-            ["subject_id", "group", "session", "session_id", "run_id"],
-            observed=False,
-        )["reaction_time_ms"]
-        .agg(["mean", "std", "count"])
-        .reset_index()
-        .rename(columns={
-            "mean": "run_mean_rt_ms",
-            "std": "run_sd_rt_ms",
-            "count": "n_trials_before",
-        })
-    )
+    """Apply one +/-3 sample-SD filter per participant/session, pooling runs/conditions.
 
-    merged = trial_data.merge(
-        grouped,
-        on=["subject_id", "group", "session", "session_id", "run_id"],
-        how="left",
+    Input must contain correct trials with finite positive RTs. Thresholds are
+    computed once before exclusion; no iterative trimming or minimum RT cutoff.
+    Return retained trials with session thresholds and a session-level report.
+    """
+    keys = ["subject_id", "group", "session", "session_id"]
+    required = set(keys + ["run_id", "trial_number", "trial_type", "response", "reaction_time_ms"])
+    if trial_data.empty or not required.issubset(trial_data.columns):
+        raise ValueError(f"Stroop SD filtering requires nonempty correct-trial data with columns {sorted(required)}.")
+    data = trial_data.copy()
+    if data[list(required)].isna().any().any():
+        raise ValueError("Stroop SD filtering requires nonmissing correct-trial data.")
+    if (not data.response.eq(1).all() or not np.isfinite(data.reaction_time_ms).all()
+            or not data.reaction_time_ms.gt(0).all()):
+        raise ValueError("Stroop SD filtering accepts only correct trials with finite positive RTs.")
+    if not data.session.eq(data.session_id.map({1: "pre", 5: "post"})).all():
+        raise ValueError("Stroop SD filtering requires consistent pre/post session labels.")
+    if data.duplicated(["subject_id", "session_id", "run_id", "trial_number"]).any():
+        raise ValueError("Duplicate trial identifiers in Stroop SD filtering input.")
+    grouped = data.groupby(keys, observed=True).agg(
+        session_mean_rt_ms=("reaction_time_ms", "mean"),
+        session_sd_rt_ms=("reaction_time_ms", "std"),
+        n_trials_before=("reaction_time_ms", "size"),
+        n_runs=("run_id", "nunique"),
+    ).reset_index()
+    merged = data.merge(grouped, on=keys, how="left", validate="many_to_one")
+    # pandas std uses ddof=1, matching the distractor-task sample SD.
+    merged["is_outlier"] = (
+        merged.session_sd_rt_ms.gt(0)
+        & (merged.reaction_time_ms - merged.session_mean_rt_ms).abs().gt(3 * merged.session_sd_rt_ms)
     )
-
-    merged["is_outlier"] = False
-    valid_sd_mask = merged["run_sd_rt_ms"].notna() & (merged["run_sd_rt_ms"] > 0)
-    merged.loc[valid_sd_mask, "is_outlier"] = (
-        np.abs(
-            merged.loc[valid_sd_mask, "reaction_time_ms"] -
-            merged.loc[valid_sd_mask, "run_mean_rt_ms"]
-        ) > (3 * merged.loc[valid_sd_mask, "run_sd_rt_ms"])
-    )
-
-    outlier_report = (
-        merged.groupby(
-            ["subject_id", "group", "session", "session_id", "run_id"],
-            observed=False,
-        )
-        .agg(
-            n_trials_before=("reaction_time_ms", "size"),
-            n_outliers_removed=("is_outlier", "sum"),
-            mean_before_ms=("reaction_time_ms", "mean"),
-            sd_before_ms=("reaction_time_ms", "std"),
-        )
-        .reset_index()
-    )
-    outlier_report["percent_removed"] = (
-        outlier_report["n_outliers_removed"] / outlier_report["n_trials_before"] * 100.0
-    )
-    outlier_report["n_trials_after"] = (
-        outlier_report["n_trials_before"] - outlier_report["n_outliers_removed"]
-    )
-
-    cleaned = merged.loc[~merged["is_outlier"]].copy()
-    return cleaned, outlier_report
+    removed = merged.groupby(keys, observed=True).is_outlier.sum().reset_index(name="n_outliers_removed")
+    report = grouped.merge(removed, on=keys, validate="one_to_one")
+    report["mean_before_ms"] = report.session_mean_rt_ms
+    report["sd_before_ms"] = report.session_sd_rt_ms
+    report["lower_threshold_ms"] = report.session_mean_rt_ms - 3 * report.session_sd_rt_ms
+    report["upper_threshold_ms"] = report.session_mean_rt_ms + 3 * report.session_sd_rt_ms
+    report["n_trials_after"] = report.n_trials_before - report.n_outliers_removed
+    report["percent_removed"] = report.n_outliers_removed / report.n_trials_before * 100
+    cleaned = merged.loc[~merged.is_outlier].copy()
+    if len(cleaned) + report.n_outliers_removed.sum() != len(data):
+        raise RuntimeError("Stroop SD exclusion counts do not reconcile with input trials.")
+    unestimable = int((report.session_sd_rt_ms.isna() | report.session_sd_rt_ms.eq(0)).sum())
+    if unestimable:
+        _print_warning(f"{unestimable} Stroop participant/sessions have zero or undefined SD; no SD exclusions there.")
+    print(f"Stroop RT: one +/-3 SD pass within {len(report)} participant/sessions, "
+          "pooling both runs and congruency conditions.")
+    print(f"Correct trials before: {len(data)}; SD outliers: {int(report.n_outliers_removed.sum())}; "
+          f"retained: {len(cleaned)}. No minimum RT cutoff applied.")
+    return cleaned, report
 
 
 def _summarize_stroop_rt_exclusions_by_subject(incorrect_trial_summary, outlier_report):
@@ -1452,10 +1487,11 @@ def _summarize_stroop_rt_exclusions_by_subject(incorrect_trial_summary, outlier_
     subject_summary = (
         outlier_report.groupby(["subject_id", "group"], observed=False)
         .agg(
-            n_runs=("run_id", "nunique"),
+            n_runs=("n_runs", "sum"),
+            n_sessions=("session_id", "nunique"),
             n_correct_trials_before=("n_trials_before", "sum"),
             n_outliers_removed=("n_outliers_removed", "sum"),
-            mean_percent_removed_across_runs=("percent_removed", "mean"),
+            mean_percent_removed_across_sessions=("percent_removed", "mean"),
         )
         .reset_index()
     )
@@ -1548,13 +1584,13 @@ def _print_stroop_reaction_time_checks(
         f"({incorrect_trial_summary['percent_incorrect_trials']:.3f}%)"
     )
 
-    print("\nRun-level outlier summary:")
+    print("\nParticipant-session outlier summary (runs and congruency pooled):")
     print(
         outlier_report[
             [
                 "subject_id",
                 "session",
-                "run_id",
+                "n_runs",
                 "n_trials_before",
                 "n_outliers_removed",
                 "percent_removed",
@@ -1587,30 +1623,30 @@ def _print_stroop_reaction_time_checks(
     print(grouped.to_string(index=False))
 
 
-def _run_stroop_rt_anova(summary_df, label):
-    """Run a subject-adjusted two-factor ANOVA on Stroop RT."""
-    anova_data = summary_df.copy()
-    formula = "mean_rt_ms ~ C(subject_id) + C(session) * C(group)"
-    model = ols(formula, data=anova_data).fit()
-    anova_table = anova_lm(model, typ=2)
+def run_stroop_rt_mixed_anova(summary_df):
+    """Test Group x Session x Congruency on unchanged participant mean RTs.
 
-    residual_ss = anova_table.loc["Residual", "sum_sq"]
-    anova_report = anova_table.reset_index().rename(columns={"index": "effect"})
-    anova_report["partial_eta_sq"] = np.where(
-        anova_report["effect"] != "Residual",
-        anova_report["sum_sq"] / (anova_report["sum_sq"] + residual_ss),
-        np.nan,
-    )
-
-    print(f"\n--- {label.title()} RT: 2-Way ANOVA (Time × Group) ---")
-    print(anova_report.to_string(index=False))
-
-    return {
-        "model": model,
-        "anova_table": anova_table,
-        "anova_report": anova_report,
-        "r_squared": model.rsquared,
-    }
+    Pass only congruent/incongruent rows from summarize_stroop_reaction_time(),
+    without overall rows. No trial exclusions or RT averaging are repeated.
+    The shared engine validates positive finite means, complete four-cell
+    coverage, and equal group sizes, and reports all seven effects with their
+    corresponding participant error strata and partial eta squared.
+    Also return group-cell means/SEM and descriptive 95% t confidence intervals.
+    """
+    result = _run_behavioral_2x2x2_mixed_anova(
+        summary_df, "mean_rt_ms", "RT", condition_levels=("congruent", "incongruent"),
+        condition_label="Congruency", task_label="STROOP")
+    cells = result["input_data"].groupby(
+        ["group", "session", "trial_type"], observed=True).mean_rt_ms.agg(
+            mean="mean", std="std", n_subjects="count").reset_index()
+    cells["sem"] = cells["std"] / np.sqrt(cells.n_subjects)
+    margin = stats.t.ppf(.975, cells.n_subjects - 1) * cells["sem"]
+    cells["ci95_low"] = cells["mean"] - margin
+    cells["ci95_high"] = cells["mean"] + margin
+    print("Stroop RT group-cell summaries (milliseconds; participants weighted equally):")
+    print(cells.to_string(index=False))
+    result["cell_summary"] = cells
+    return result
 
 
 def _plot_stroop_reaction_time_figures(subject_session_summary, pre_outlier_trial_data):
@@ -1775,30 +1811,11 @@ def _print_stroop_effect_checks(
     print(subject_session_stroop_effect.to_string(index=False))
 
 
-def _run_stroop_effect_anova(subject_session_stroop_effect):
-    """Run a subject-adjusted two-factor ANOVA on Stroop effect."""
-    anova_data = subject_session_stroop_effect.copy()
-    formula = "stroop_effect_ms ~ C(subject_id) + C(group) * C(session)"
-    model = ols(formula, data=anova_data).fit()
-    anova_table = anova_lm(model, typ=2)
-
-    residual_ss = anova_table.loc["Residual", "sum_sq"]
-    anova_report = anova_table.reset_index().rename(columns={"index": "effect"})
-    anova_report["partial_eta_sq"] = np.where(
-        anova_report["effect"] != "Residual",
-        anova_report["sum_sq"] / (anova_report["sum_sq"] + residual_ss),
-        np.nan,
+def _run_stroop_effect_anova(summary_df):
+    """Run Group x Session mixed ANOVA with participant-specific error strata."""
+    return run_behavioral_prepost_mixed_anova(
+        summary_df, value_col="stroop_effect_ms", outcome_label="Stroop interference",
     )
-
-    print("Stroop-effect ANOVA (subject-adjusted Time × Group):")
-    print(anova_report.to_string(index=False))
-
-    return {
-        "model": model,
-        "anova_table": anova_table,
-        "anova_report": anova_report,
-        "r_squared": model.rsquared,
-    }
 
 
 def _run_stroop_effect_posthocs(subject_session_stroop_effect):
@@ -2008,7 +2025,7 @@ def analyze_reaction_time(df):
         'outlier_report', 'subject_session_summary', 'cell_summary',
         'stats_anova', 'posthoc_tests', 'figures', 'warnings'
     """
-    _require_statistical_dependencies(require_scipy=True, require_statsmodels=True)
+    _require_statistical_dependencies(require_scipy=True, require_statsmodels=False)
 
     print("=" * 80)
     print("ANALYSIS 1: Reaction Time")
@@ -2042,7 +2059,8 @@ def analyze_reaction_time(df):
     )
     subject_session_exclusion_report["total_removed_before_sd"] = (
         subject_session_exclusion_report["n_removed_non_correct"] +
-        subject_session_exclusion_report["n_removed_rt_lt_150"]
+        subject_session_exclusion_report["n_removed_rt_lt_150"] +
+        subject_session_exclusion_report["n_removed_missing_rt"]
     )
     subject_session_exclusion_report["total_removed_all_filters"] = (
         subject_session_exclusion_report["total_removed_before_sd"] +
@@ -2054,6 +2072,10 @@ def analyze_reaction_time(df):
     )
     subject_session_exclusion_report["percent_removed_rt_lt_150"] = (
         subject_session_exclusion_report["n_removed_rt_lt_150"] /
+        subject_session_exclusion_report["n_total_trials"] * 100.0
+    )
+    subject_session_exclusion_report["percent_removed_missing_rt"] = (
+        subject_session_exclusion_report["n_removed_missing_rt"] /
         subject_session_exclusion_report["n_total_trials"] * 100.0
     )
     subject_session_exclusion_report["percent_removed_before_sd"] = (
@@ -2093,7 +2115,7 @@ def analyze_reaction_time(df):
     print("\n" + "=" * 80)
     print("STATISTICAL ANALYSES")
     print("=" * 80)
-    stats_anova = _run_reaction_time_anova(subject_session_summary)
+    stats_anova = run_training_rt_mixed_anova(subject_session_summary)
     posthoc_tests = _run_reaction_time_posthocs(subject_session_summary)
 
     print("\n" + "=" * 80)
@@ -2267,10 +2289,19 @@ def _build_rt_exclusion_report(data):
         how="left",
     )
     report["n_removed_rt_lt_150"] = report["n_removed_rt_lt_150"].fillna(0).astype(int)
+    # Mutually exclusive reasons: incorrect/timeout rows are already counted above.
+    missing_rt = (
+        data.assign(missing_correct_rt=(data["feedback"] == 1) & data["rt_ms"].isna())
+        .groupby(["subject_id", "group", "session"], observed=False)["missing_correct_rt"]
+        .sum().reset_index(name="n_removed_missing_rt")
+    )
+    report = report.merge(missing_rt, on=["subject_id", "group", "session"], validate="one_to_one")
+    report["n_removed_missing_rt"] = report["n_removed_missing_rt"].astype(int)
     report["n_retained_before_sd"] = (
         report["n_total_trials"]
         - report["n_removed_non_correct"]
         - report["n_removed_rt_lt_150"]
+        - report["n_removed_missing_rt"]
     )
     return report
 
@@ -2280,6 +2311,7 @@ def _summarize_rt_exclusions_by_session(subject_session_exclusion_report):
     metrics = [
         "percent_removed_non_correct",
         "percent_removed_rt_lt_150",
+        "percent_removed_missing_rt",
         "percent_outliers_removed",
         "percent_removed_before_sd",
         "percent_removed_all_filters",
@@ -2310,6 +2342,7 @@ def _summarize_rt_exclusions_by_session(subject_session_exclusion_report):
             n_total_trials=("n_total_trials", "sum"),
             n_removed_non_correct=("n_removed_non_correct", "sum"),
             n_removed_rt_lt_150=("n_removed_rt_lt_150", "sum"),
+            n_removed_missing_rt=("n_removed_missing_rt", "sum"),
             n_outliers_removed=("n_outliers_removed", "sum"),
             total_removed_before_sd=("total_removed_before_sd", "sum"),
             total_removed_all_filters=("total_removed_all_filters", "sum"),
@@ -2322,6 +2355,10 @@ def _summarize_rt_exclusions_by_session(subject_session_exclusion_report):
     )
     all_sessions_subject["percent_removed_rt_lt_150"] = (
         all_sessions_subject["n_removed_rt_lt_150"] /
+        all_sessions_subject["n_total_trials"] * 100.0
+    )
+    all_sessions_subject["percent_removed_missing_rt"] = (
+        all_sessions_subject["n_removed_missing_rt"] /
         all_sessions_subject["n_total_trials"] * 100.0
     )
     all_sessions_subject["percent_outliers_removed"] = (
@@ -2469,6 +2506,7 @@ def _print_reaction_time_checks(
         "n_total_trials",
         "percent_removed_non_correct",
         "percent_removed_rt_lt_150",
+        "percent_removed_missing_rt",
         "percent_outliers_removed",
         "percent_removed_all_filters",
     ]
@@ -2486,6 +2524,10 @@ def _print_reaction_time_checks(
             f"{row['percent_removed_rt_lt_150_sem']:.2f}%"
         )
         print(
+            f"  missing correct-trial RT = {row['percent_removed_missing_rt_mean']:.2f}% ± "
+            f"{row['percent_removed_missing_rt_sem']:.2f}%"
+        )
+        print(
             f"  SD outliers = {row['percent_outliers_removed_mean']:.2f}% ± "
             f"{row['percent_outliers_removed_sem']:.2f}%"
         )
@@ -2495,33 +2537,356 @@ def _print_reaction_time_checks(
         )
 
 
-def _run_reaction_time_anova(summary_df):
-    """Run a subject-adjusted three-factor ANOVA on mean RT."""
-    anova_data = summary_df.copy()
-    formula = "mean_rt_ms ~ C(subject_id) + C(group) * C(session) * C(trial_type)"
-    model = ols(formula, data=anova_data).fit()
-    anova_table = anova_lm(model, typ=2)
+def summarize_training_accuracy_after_rt_filter(df, min_rt_ms=150.0):
+    """Exclude RT < cutoff first, then compute correct/(correct + incorrect).
 
-    residual_ss = anova_table.loc["Residual", "sum_sq"]
-    anova_report = anova_table.reset_index().rename(columns={"index": "effect"})
-    anova_report["partial_eta_sq"] = np.where(
-        anova_report["effect"] != "Residual",
-        anova_report["sum_sq"] / (anova_report["sum_sq"] + residual_ss),
-        np.nan,
-    )
+    Uses the corrected non-practice training trial table, not RT-analysis
+    cleaned trials. Retains slow responses and both correct/incorrect outcomes.
+    Missing RT is not classified as below cutoff: correctness-coded trials
+    with missing RT remain eligible, are counted, and trigger a warning.
+    Timeouts are excluded after the RT cutoff. No SD filtering is applied.
+    Returns participant summaries, exclusions, retained trials, group summaries,
+    run coverage, and warnings. Does not mutate df or write files.
+    """
+    _require_statistical_dependencies(require_scipy=True, require_statsmodels=False)
+    required = {"subject_id", "group", "session_id", "run_id", "trial",
+                "feedback", "rt_ms", "rt_source"}
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise ValueError("Accuracy analysis requires a nonempty corrected training trial table.")
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"Accuracy analysis is missing columns: {missing}; use corrected training data.")
+    if not np.isfinite(min_rt_ms) or min_rt_ms < 0:
+        raise ValueError("min_rt_ms must be a finite nonnegative millisecond cutoff.")
+    data = df.copy()
+    warnings_list = []
+    if "task_type" in data:
+        removed = int(data["task_type"].ne("training").sum())
+        data = data.loc[data["task_type"].eq("training")].copy()
+        print(f"Non-training/practice rows excluded before accuracy analysis: {removed}.")
+    else:
+        warnings_list.append("No task_type column: input must already exclude practice/non-training runs.")
+    if data.empty:
+        raise ValueError("No non-practice training trials remain.")
+    if data[list(required - {"rt_ms"})].isna().any().any():
+        raise ValueError("Training identifiers, feedback, and RT provenance must be nonmissing.")
+    if not data["rt_source"].isin(["gdf_status", "trigger_text_fallback"]).all():
+        raise ValueError("Legacy or unknown RT provenance; use the corrected GDF/text-fallback table.")
+    data["rt_ms"] = pd.to_numeric(data["rt_ms"], errors="raise")
+    finite_rt = data["rt_ms"].dropna()
+    if not np.isfinite(finite_rt).all() or (finite_rt < 0).any():
+        raise ValueError("Observed rt_ms values must be finite and nonnegative.")
+    fallback = data["rt_source"].eq("trigger_text_fallback")
+    if not data.loc[fallback, "rt_ms"].between(0, 50, inclusive="left").all():
+        raise ValueError("Text fallback RTs must be in [0, 50) ms.")
+    if not data["feedback"].isin([1, 2, 3]).all() or not data["session_id"].isin([1, 5]).all():
+        raise ValueError("Expected feedback 1/2/3 and sessions 1/5 for training accuracy.")
+    condition_col = "task" if "task" in data else "trial_type"
+    if condition_col not in data or not data[condition_col].isin([0, 1]).all():
+        raise ValueError("Accuracy requires task or trial_type coded 0=absent, 1=present.")
+    roster = {subject: "experimental" for subject in BCI_GROUP_SUBJECTS}
+    roster.update({subject: "control" for subject in CONTROL_GROUP_SUBJECTS})
+    if not data["subject_id"].map(roster).eq(data["group"]).all():
+        raise ValueError("Subject/group assignments disagree with the configured study roster.")
+    keys = ["subject_id", "session_id", "run_id", "trial"]
+    if data.duplicated(keys).any():
+        raise ValueError("Duplicate training subject/session/run/trial identifiers.")
+    for key, run in data.groupby(keys[:-1], observed=True):
+        if len(run) != 60 or sorted(run["trial"].tolist()) != list(range(1, 61)):
+            raise ValueError(f"Training run {key}: expected 60 trials numbered 1..60.")
+        if run[condition_col].value_counts().to_dict() != {0: 30, 1: 30}:
+            raise ValueError(f"Training run {key}: expected 30 trials per distractor condition.")
+    coverage = data.groupby(["subject_id", "session_id"], observed=True)["run_id"].nunique().reset_index(name="n_runs")
+    coverage["expected_n_runs"] = coverage["session_id"].map({1: 8, 5: 4})
+    run_issues = coverage.loc[coverage.n_runs != coverage.expected_n_runs]
+    if not run_issues.empty:
+        warnings_list.append("Run counts differ from documented 8/4; retaining available complete runs.")
+        print(run_issues.to_string(index=False))
+    if data.subject_id.nunique() != len(roster):
+        warnings_list.append(f"Using {data.subject_id.nunique()} of {len(roster)} configured participants.")
 
-    print(
-        "Mixed-design RT ANOVA is implemented with SciPy/Statsmodels preference "
-        "using a subject-adjusted OLS model (subject fixed effects + Time x Trial Type x Group)."
-    )
-    print(anova_report.to_string(index=False))
+    data["session"] = data["session_id"].map({1: "pre", 5: "post"})
+    data["trial_type"] = data[condition_col].map({0: "no_distractor", 1: "distractor"})
+    data["excluded_fast_rt"] = data["rt_ms"].lt(min_rt_ms)
+    data["excluded_timeout_after_rt"] = ~data.excluded_fast_rt & data.feedback.eq(3)
+    eligible = ~data.excluded_fast_rt & data.feedback.isin([1, 2])
+    data["accuracy_correct"] = eligible & data.feedback.eq(1)
+    data["accuracy_incorrect"] = eligible & data.feedback.eq(2)
+    data["eligible_missing_rt"] = eligible & data.rt_ms.isna()
+    group_keys = ["subject_id", "group", "session", "trial_type"]
+    summary = data.groupby(group_keys, observed=True).agg(
+        n_total_trials=("feedback", "size"),
+        n_removed_rt_lt_cutoff=("excluded_fast_rt", "sum"),
+        n_timeouts_after_rt_filter=("excluded_timeout_after_rt", "sum"),
+        n_correct=("accuracy_correct", "sum"),
+        n_incorrect=("accuracy_incorrect", "sum"),
+        n_missing_rt_retained=("eligible_missing_rt", "sum"),
+    ).reset_index()
+    summary["n_accuracy_trials"] = summary.n_correct + summary.n_incorrect
+    if summary.n_accuracy_trials.eq(0).any():
+        bad = summary.loc[summary.n_accuracy_trials.eq(0), group_keys].to_dict("records")
+        raise ValueError(f"Zero accuracy denominator after exclusions: {bad}")
+    if not (summary.n_accuracy_trials + summary.n_removed_rt_lt_cutoff
+            + summary.n_timeouts_after_rt_filter).eq(summary.n_total_trials).all():
+        raise RuntimeError("Accuracy exclusion counts do not reconcile with trial totals.")
+    summary["accuracy"] = summary.n_correct / summary.n_accuracy_trials
+    summary["percent_removed"] = 100 * (1 - summary.n_accuracy_trials / summary.n_total_trials)
+    missing_count = int(summary.n_missing_rt_retained.sum())
+    if missing_count:
+        warnings_list.append(f"Retaining {missing_count} correct/incorrect trials with unknown RT: "
+                             "RT < cutoff is the only latency exclusion; unknown is not classified as fast.")
+    for warning in warnings_list:
+        _print_warning(warning)
+    cell_summary = summary.groupby(["group", "session", "trial_type"], observed=True).accuracy.agg(
+        mean="mean", std="std", n_subjects="count").reset_index()
+    cell_summary["sem"] = cell_summary["std"] / np.sqrt(cell_summary.n_subjects)
+    margin = stats.t.ppf(0.975, cell_summary.n_subjects - 1) * cell_summary["sem"]
+    cell_summary["ci95_low"] = cell_summary["mean"] - margin
+    cell_summary["ci95_high"] = cell_summary["mean"] + margin
+    print(f"\nAccuracy: RT < {min_rt_ms:g} ms excluded before correct/(correct + incorrect).")
+    print(f"Validated {len(data)} trials in {len(data.groupby(keys[:-1]))} complete runs.")
+    print(f"Fast trials removed: {int(data.excluded_fast_rt.sum())}; by feedback: "
+          f"{data.loc[data.excluded_fast_rt, 'feedback'].value_counts().sort_index().to_dict()}.")
+    print(f"Timeouts excluded subsequently: {int(data.excluded_timeout_after_rt.sum())}; "
+          f"accuracy denominator: {int(eligible.sum())}; missing RT retained: {missing_count}.")
+    print("Both correct and incorrect trials retained; no SD-outlier filtering.")
+    print(cell_summary.to_string(index=False))
+    return {"subject_session_summary": summary, "cell_summary": cell_summary,
+            "exclusion_report": summary[group_keys + ["n_total_trials", "n_removed_rt_lt_cutoff",
+                "n_timeouts_after_rt_filter", "n_accuracy_trials", "n_missing_rt_retained",
+                "percent_removed"]].copy(),
+            "trial_data_after_rt_filter": data.loc[~data.excluded_fast_rt].copy(),
+            "accuracy_trial_data": data.loc[eligible].copy(),
+            "run_coverage": coverage, "warnings": warnings_list, "min_rt_ms": min_rt_ms}
 
-    return {
-        "model": model,
-        "anova_table": anova_table,
-        "anova_report": anova_report,
-        "r_squared": model.rsquared,
+
+def analyze_training_accuracy_mixed_anova(df, min_rt_ms=150.0):
+    """Validate and summarize RT-filtered accuracy, then run the mixed ANOVA."""
+    results = summarize_training_accuracy_after_rt_filter(df, min_rt_ms=min_rt_ms)
+    results["stats_anova"] = run_training_accuracy_mixed_anova(results["subject_session_summary"])
+    print("Accuracy analysis complete: validated exclusions, participant means, and seven ANOVA effects.")
+    return results
+
+
+def run_training_rt_mixed_anova(summary_df):
+    """Run the balanced 2 x 2 x 2 mixed ANOVA on unchanged mean RTs.
+
+    Requires complete positive participant x session x condition means in ms.
+    Validation, error strata, and printed diagnostics are delegated to the
+    shared engine. No trial preprocessing occurs here.
+    """
+    return _run_behavioral_2x2x2_mixed_anova(summary_df, "mean_rt_ms", "RT")
+
+
+def run_training_accuracy_mixed_anova(summary_df):
+    """Run the same mixed ANOVA on complete participant-level accuracies.
+
+    Accuracy must be finite and in [0, 1]. Use
+    summarize_training_accuracy_after_rt_filter() to apply the RT cutoff first.
+    The shared engine validates coverage and prints all seven effects.
+    """
+    return _run_behavioral_2x2x2_mixed_anova(summary_df, "accuracy", "ACCURACY")
+
+
+def _run_behavioral_2x2x2_mixed_anova(
+    summary_df, value_col, outcome_label, *,
+    condition_levels=("no_distractor", "distractor"),
+    condition_label="Distractor Condition", task_label="TRAINING",
+):
+    """Balanced Group x Session x Condition ANOVA with separate error strata.
+
+    Group is between participants; Session and Condition are within. Four
+    orthogonal unit-length contrasts partition participant means, Session,
+    Condition, and Session x Condition. Each component has its own within-group
+    participant residual, giving the classical balanced mixed ANOVA. All seven
+    numerator dfs are 1; error df=N-2. Sphericity corrections are unnecessary.
+    Group variance homogeneity is assumed. Reject missing/duplicate cells,
+    invalid values, or unbalanced groups rather than silently dropping data.
+    Returns tables, participant contrasts, input data, and diagnostics; no OLS
+    model or shared residual is fitted. Input data are never mutated.
+    """
+    _require_statistical_dependencies(require_scipy=True, require_statsmodels=False)
+    if len(condition_levels) != 2 or len(set(condition_levels)) != 2:
+        raise ValueError("Mixed ANOVA requires exactly two distinct condition levels.")
+    required = {"subject_id", "group", "session", "trial_type", value_col}
+    if not isinstance(summary_df, pd.DataFrame) or summary_df.empty:
+        raise ValueError("Mixed ANOVA requires a nonempty participant-level DataFrame.")
+    missing = sorted(required - set(summary_df.columns))
+    if missing:
+        raise ValueError(f"Mixed ANOVA is missing required columns: {missing}")
+    data = summary_df[sorted(required)].copy()
+    if data.isna().any().any():
+        raise ValueError("Mixed ANOVA requires complete nonmissing cells; no rows are dropped.")
+    data[value_col] = pd.to_numeric(data[value_col], errors="raise")
+    if not np.isfinite(data[value_col]).all():
+        raise ValueError(f"Mixed ANOVA {value_col} must contain finite values.")
+    if value_col == "mean_rt_ms" and (data[value_col] <= 0).any():
+        raise ValueError("Mean RTs must be positive milliseconds.")
+    if value_col == "accuracy" and not data[value_col].between(0, 1).all():
+        raise ValueError("Accuracy must lie in [0, 1], including possible zero accuracy.")
+    levels = {
+        "group": ["control", "experimental"],
+        "session": ["pre", "post"],
+        "trial_type": list(condition_levels),
     }
+    for column, expected in levels.items():
+        if set(data[column]) != set(expected):
+            raise ValueError(f"Mixed ANOVA expects {column} levels {expected}.")
+    membership = data.groupby("subject_id", observed=True)["group"].nunique()
+    if (membership != 1).any():
+        raise ValueError("Each participant must belong to exactly one group.")
+    keys = ["subject_id", "session", "trial_type"]
+    if data.duplicated(keys).any():
+        raise ValueError("Duplicate participant x session x condition cells in mixed ANOVA.")
+
+    columns = pd.MultiIndex.from_product([levels["session"], levels["trial_type"]])
+    wide = data.pivot(index=["subject_id", "group"], columns=["session", "trial_type"],
+                      values=value_col).reindex(columns=columns)
+    if wide.isna().any().any():
+        incomplete = wide.index[wide.isna().any(axis=1)].tolist()
+        raise ValueError(f"Complete four-cell coverage is required; incomplete: {incomplete}")
+    group_labels = wide.index.get_level_values("group").to_numpy()
+    counts = pd.Series(group_labels).value_counts().to_dict()
+    if len(set(counts.values())) != 1 or min(counts.values()) < 2:
+        raise ValueError(f"Balanced groups with at least two participants each required: {counts}")
+
+    # Cell order: pre first/second condition, then post first/second condition.
+    # Normalization preserves sums of squares in the original four-cell space.
+    weights = np.array([[1, 1, 1, 1], [-1, -1, 1, 1],
+                        [-1, 1, -1, 1], [1, -1, -1, 1]], dtype=float) / 2.0
+    components = ["Participant mean", "Session", condition_label,
+                  f"Session x {condition_label}"]
+    scores = wide.to_numpy() @ weights.T
+    contrast_table = pd.DataFrame(scores, index=wide.index, columns=components).reset_index()
+    n_subjects = len(wide)
+    error_df = n_subjects - 2
+    rows, error_rows = [], []
+    for component_index, component in enumerate(components):
+        values = scores[:, component_index]
+        grand = values.mean()
+        group_means = {g: values[group_labels == g].mean() for g in levels["group"]}
+        ss_between = sum(counts[g] * (group_means[g] - grand) ** 2 for g in levels["group"])
+        ss_error = sum(np.sum((values[group_labels == g] - group_means[g]) ** 2)
+                       for g in levels["group"])
+        error_term = ("Subject(Group)" if component_index == 0
+                      else f"{component} x Subject(Group)")
+        error_ms = ss_error / error_df
+        if error_ms <= 0:
+            raise ValueError(f"Zero residual variance for {error_term}; F test is undefined.")
+        error_rows.append({"error_term": error_term, "sum_sq": ss_error,
+                           "df": error_df, "mean_sq": error_ms})
+        effects = ([("Group", ss_between)] if component_index == 0 else
+                   [(component, n_subjects * grand ** 2),
+                    (f"Group x {component}", ss_between)])
+        for effect, ss_effect in effects:
+            f_value = ss_effect / error_ms
+            rows.append({"effect": effect, "sum_sq": ss_effect, "df": 1,
+                         "mean_sq": ss_effect, "error_term": error_term,
+                         "error_df": error_df, "error_mean_sq": error_ms,
+                         "F": f_value, "PR(>F)": stats.f.sf(f_value, 1, error_df),
+                         "partial_eta_sq": ss_effect / (ss_effect + ss_error)})
+
+    order = ["Group", "Session", condition_label, "Group x Session",
+             f"Group x {condition_label}", f"Session x {condition_label}",
+             f"Group x Session x {condition_label}"]
+    anova_table = pd.DataFrame(rows).set_index("effect").loc[order]
+    error_terms = pd.DataFrame(error_rows)
+    total_ss = float(np.sum((wide.to_numpy() - wide.to_numpy().mean()) ** 2))
+    partitioned_ss = float(anova_table["sum_sq"].sum() + error_terms["sum_sq"].sum())
+    if not np.isclose(total_ss, partitioned_ss, rtol=1e-10, atol=1e-8):
+        raise RuntimeError("Mixed ANOVA sums of squares do not reconstruct total variation.")
+    print(f"\n{task_label} {outcome_label}: 2 x 2 x 2 MIXED-DESIGN ANOVA")
+    print(f"Between: Group (control/BCI); within: Session (pre/post) x {condition_label}.")
+    print(f"Validated {n_subjects} participants, four cells each; group counts: {counts}.")
+    print(f"Existing {value_col} summaries used unchanged; no additional trial exclusions or averaging.")
+    print("Separate error strata; numerator df=1 for every effect; sphericity correction not needed.")
+    print(anova_table.reset_index().to_string(index=False, float_format=lambda value: f"{value:.9g}"))
+    print(f"Sum-of-squares partition validated: {partitioned_ss:.9g} (squared outcome units).")
+    return {
+        "anova_table": anova_table,
+        "anova_report": anova_table.reset_index(),
+        "error_terms": error_terms,
+        "participant_contrasts": contrast_table,
+        "input_data": data,
+        "diagnostics": {"n_subjects": n_subjects, "subjects_by_group": counts,
+                        "n_cells": len(data), "total_sum_sq": total_ss,
+                        "partitioned_sum_sq": partitioned_ss,
+                        "sphericity": "Not required: all within effects have one degree of freedom."},
+    }
+
+
+def run_behavioral_prepost_mixed_anova(summary_df, value_col, outcome_label="Outcome"):
+    """Balanced Group x Session mixed ANOVA on unchanged participant summaries.
+
+    Group is tested against Subject(Group); Session and Group x Session use
+    Session x Subject(Group). Complete pre/post pairs and balanced groups are
+    required. No participant is dropped and no multiplicity correction added.
+    """
+    _require_statistical_dependencies(require_scipy=True, require_statsmodels=False)
+    required = {"subject_id", "group", "session", value_col}
+    if not isinstance(summary_df, pd.DataFrame) or summary_df.empty:
+        raise ValueError("Mixed ANOVA requires a nonempty participant-level DataFrame.")
+    missing = sorted(required - set(summary_df.columns))
+    if missing:
+        raise ValueError(f"Mixed ANOVA is missing required columns: {missing}")
+    data = summary_df[sorted(required)].copy()
+    if data.isna().any().any():
+        raise ValueError("Mixed ANOVA requires complete nonmissing cells; no rows are dropped.")
+    data[value_col] = pd.to_numeric(data[value_col], errors="raise")
+    if not np.isfinite(data[value_col]).all():
+        raise ValueError(f"Mixed ANOVA {value_col} must contain finite values.")
+    if value_col in {"accuracy", "timeout_rate"} and not data[value_col].between(0, 1).all():
+        raise ValueError(f"{value_col} must lie in [0, 1].")
+    if set(data.group) != {"control", "experimental"} or set(data.session) != {"pre", "post"}:
+        raise ValueError("Expected control/experimental groups and pre/post sessions.")
+    if not data.groupby("subject_id").group.nunique().eq(1).all():
+        raise ValueError("Each participant must belong to exactly one group.")
+    if data.duplicated(["subject_id", "session"]).any():
+        raise ValueError("Duplicate participant x session cells in mixed ANOVA.")
+    wide = data.pivot(index=["subject_id", "group"], columns="session", values=value_col)
+    wide = wide.reindex(columns=["pre", "post"])
+    if wide.isna().any().any():
+        raise ValueError("Complete pre/post pairs are required; no participants are dropped.")
+    labels = wide.index.get_level_values("group").to_numpy()
+    counts = pd.Series(labels).value_counts().to_dict()
+    if len(set(counts.values())) != 1 or min(counts.values()) < 2:
+        raise ValueError(f"Balanced groups with at least two participants each required: {counts}")
+    # Orthonormal contrasts preserve total sums of squares in outcome units.
+    scores = wide.to_numpy() @ (np.array([[1, -1], [1, 1]]) / np.sqrt(2))
+    n, error_df = len(wide), len(wide) - 2
+    rows, errors = [], []
+    for i, term in enumerate(["Subject(Group)", "Session x Subject(Group)"]):
+        values = scores[:, i]
+        group_means = {group: values[labels == group].mean() for group in counts}
+        grand = values.mean()
+        ss_group = sum(counts[group] * (group_means[group] - grand) ** 2 for group in counts)
+        ss_error = sum(np.sum((values[labels == group] - group_means[group]) ** 2) for group in counts)
+        ms_error = ss_error / error_df
+        if ms_error <= 0:
+            raise ValueError(f"Zero residual variance for {term}; F test is undefined.")
+        errors.append(dict(error_term=term, sum_sq=ss_error, df=error_df, mean_sq=ms_error))
+        effects = [("Group", ss_group)] if i == 0 else [("Session", n * grand ** 2), ("Group x Session", ss_group)]
+        for effect, ss_effect in effects:
+            f_value = ss_effect / ms_error
+            rows.append(dict(effect=effect, sum_sq=ss_effect, df=1, mean_sq=ss_effect,
+                             error_term=term, error_df=error_df, error_mean_sq=ms_error,
+                             F=f_value, **{"PR(>F)": stats.f.sf(f_value, 1, error_df)},
+                             partial_eta_sq=ss_effect / (ss_effect + ss_error)))
+    table = pd.DataFrame(rows).set_index("effect")
+    error_terms = pd.DataFrame(errors)
+    total = float(np.sum((wide.to_numpy() - wide.to_numpy().mean()) ** 2))
+    partition = float(table.sum_sq.sum() + error_terms.sum_sq.sum())
+    if not np.isclose(total, partition, rtol=1e-10, atol=1e-8):
+        raise RuntimeError("Mixed ANOVA sums of squares do not reconstruct total variation.")
+    print(f"{outcome_label}: Group x Session mixed ANOVA; {n} complete participants, groups {counts}.")
+    print("Participant means and change scores use separate error strata; no extra exclusions; unadjusted p values.")
+    print(table.reset_index().to_string(index=False))
+    return dict(anova_table=table, anova_report=table.reset_index(), error_terms=error_terms,
+                participant_contrasts=pd.DataFrame(scores, index=wide.index,
+                    columns=["Participant mean", "Session"]).reset_index(), input_data=data,
+                diagnostics=dict(n_subjects=n, subjects_by_group=counts, n_cells=len(data),
+                                 total_sum_sq=total, partitioned_sum_sq=partition,
+                                 sphericity="Not required: two within-participant levels."))
 
 
 def _run_reaction_time_posthocs(summary_df):
@@ -2820,41 +3185,7 @@ def summarize_training_rt_change_scores(df, tolerance_ms=1e-8):
             f"{agreement.to_string(index=False)}"
         )
 
-    welch_rows = []
-    for trial_type in ["distractor", "no_distractor"]:
-        subset = change_scores[change_scores["trial_type"] == trial_type]
-        bci_values = subset.loc[
-            subset["group"] == "experimental", "rt_change_ms"
-        ].to_numpy()
-        control_values = subset.loc[
-            subset["group"] == "control", "rt_change_ms"
-        ].to_numpy()
-        if len(bci_values) < 2 or len(control_values) < 2:
-            raise ValueError(
-                f"Welch test for {trial_type} requires at least two participants per group."
-            )
-
-        statistic, p_value = stats.ttest_ind(
-            bci_values, control_values, equal_var=False
-        )
-        ci_low, ci_high = _welch_mean_difference_ci(bci_values, control_values)
-        welch_rows.append({
-            "trial_type": trial_type,
-            "comparison": "BCI - Mental Rehearsal RT change",
-            "n_bci": len(bci_values),
-            "n_control": len(control_values),
-            "bci_mean_rt_change_ms": float(np.mean(bci_values)),
-            "mental_rehearsal_mean_rt_change_ms": float(np.mean(control_values)),
-            "estimate_ms": float(np.mean(bci_values) - np.mean(control_values)),
-            "statistic": statistic,
-            "df": _welch_df(bci_values, control_values),
-            "p_value": p_value,
-            "effect_size": _cohens_d_independent(bci_values, control_values),
-            "effect_size_label": "cohens_d",
-            "ci95_low_ms": ci_low,
-            "ci95_high_ms": ci_high,
-        })
-    welch_tests = pd.DataFrame(welch_rows)
+    welch_tests = compare_training_rt_changes_by_condition(subject_session_summary)["welch_tests"]
 
     print("TRAINING-TASK RT CHANGE-SCORE SANITY CHECKS")
     print(f"  Source rows: {len(df)}")
@@ -3113,10 +3444,115 @@ def load_and_plot_training_rt_change_barplot(csv_path=None, save_figure=True):
     return results
 
 
+def compare_stroop_rt_changes_by_congruency(summary_df):
+    """Compare BCI-minus-control post-pre RT changes within each congruency.
+
+    Reuse participant means after pooled-session RT filtering. Two-sided Welch
+    tests compare independent groups; p values are unadjusted, as requested.
+    Negative differences indicate a larger RT decrease in BCI. Confidence
+    intervals are pointwise (unadjusted) 95% Welch intervals. Cohen's d uses the
+    pooled SD of independent participant change scores. No trials are reprocessed.
+    """
+    return _compare_rt_changes_by_condition(summary_df, ("congruent", "incongruent"))
+
+
+def compare_training_rt_changes_by_condition(summary_df):
+    """Compare BCI-minus-control post-pre changes separately by distractor condition.
+
+    Reuse cleaned participant RT means; no trial preprocessing is repeated.
+    The shared helper checks complete four-cell coverage and finite positive
+    means, then prints two-sided Welch tests, unadjusted p values, 95% Welch
+    confidence intervals, and Cohen's d on independent change scores.
+    """
+    results = _compare_rt_changes_by_condition(summary_df, ("distractor", "no_distractor"))
+    # Preserve the historical training-workflow count column.
+    results["welch_tests"]["n_control"] = results["welch_tests"].n_mental_rehearsal
+    return results
+
+
+def _compare_rt_changes_by_condition(summary_df, condition_levels):
+    """Validate complete participant means and report unadjusted group-change tests."""
+    _require_statistical_dependencies(require_scipy=True, require_statsmodels=False)
+
+    if len(condition_levels) != 2 or len(set(condition_levels)) != 2:
+        raise ValueError("RT change comparisons require exactly two distinct conditions.")
+    required = {"subject_id", "group", "session", "trial_type", "mean_rt_ms"}
+    if not isinstance(summary_df, pd.DataFrame) or summary_df.empty:
+        raise ValueError("RT change comparisons require a nonempty participant summary.")
+    if not required.issubset(summary_df.columns):
+        raise ValueError(f"Missing RT change-comparison columns: {sorted(required - set(summary_df.columns))}")
+    data = summary_df[sorted(required)].copy()
+    if data.isna().any().any():
+        raise ValueError("RT change comparisons require complete nonmissing cells.")
+    data["mean_rt_ms"] = pd.to_numeric(data.mean_rt_ms, errors="raise")
+    if not np.isfinite(data.mean_rt_ms).all() or not data.mean_rt_ms.gt(0).all():
+        raise ValueError("Mean RTs must be finite positive milliseconds.")
+    for column, levels in {"group": {"experimental", "control"},
+                           "session": {"pre", "post"},
+                           "trial_type": set(condition_levels)}.items():
+        if set(data[column]) != levels:
+            raise ValueError(f"RT change comparisons require {column} levels {sorted(levels)}.")
+    if data.groupby("subject_id").group.nunique().ne(1).any():
+        raise ValueError("Each participant must belong to exactly one group.")
+    if data.duplicated(["subject_id", "session", "trial_type"]).any():
+        raise ValueError("Duplicate participant/session/condition means.")
+    if data.groupby("subject_id").size().ne(4).any():
+        raise ValueError("Complete four-cell coverage is required for every participant.")
+    wide = data.pivot(index=["subject_id", "group", "trial_type"],
+                      columns="session", values="mean_rt_ms").reset_index()
+    change_scores = wide.rename(columns={"pre": "pre_rt_ms", "post": "post_rt_ms"})
+    change_scores["rt_change_ms"] = change_scores.post_rt_ms - change_scores.pre_rt_ms
+    change_scores = change_scores.sort_values(["trial_type", "group", "subject_id"]).reset_index(drop=True)
+    welch_rows = []
+    for trial_type in condition_levels:
+        subset = change_scores[change_scores["trial_type"] == trial_type]
+        bci_values = subset.loc[
+            subset["group"] == "experimental", "rt_change_ms"
+        ].to_numpy()
+        control_values = subset.loc[
+            subset["group"] == "control", "rt_change_ms"
+        ].to_numpy()
+        if len(bci_values) < 2 or len(control_values) < 2:
+            raise ValueError(
+                f"Welch test for {trial_type} requires at least two participants per group."
+            )
+        if np.var(bci_values, ddof=1) + np.var(control_values, ddof=1) <= 0:
+            raise ValueError(f"Zero change-score variance for {trial_type}; Welch test is undefined.")
+        statistic, p_value = stats.ttest_ind(
+            bci_values, control_values, equal_var=False
+        )
+        ci_low, ci_high = _welch_mean_difference_ci(bci_values, control_values)
+        welch_rows.append({
+            "trial_type": trial_type,
+            "comparison": "BCI - Mental Rehearsal RT change",
+            "n_bci": len(bci_values),
+            "n_mental_rehearsal": len(control_values),
+            "bci_mean_rt_change_ms": float(np.mean(bci_values)),
+            "mental_rehearsal_mean_rt_change_ms": float(np.mean(control_values)),
+            "estimate_ms": float(np.mean(bci_values) - np.mean(control_values)),
+            "statistic": statistic,
+            "df": _welch_df(bci_values, control_values),
+            "p_value": p_value,
+            "effect_size": _cohens_d_independent(bci_values, control_values),
+            "effect_size_label": "cohens_d",
+            "ci95_low_ms": ci_low,
+            "ci95_high_ms": ci_high,
+        })
+    welch_tests = pd.DataFrame(welch_rows)
+
+    welch_tests["ci_method"] = "Pointwise 95% Welch CI (not multiplicity-adjusted)"
+    print(f"Validated {data.subject_id.nunique()} participants with complete pre/post RTs in both conditions.")
+    print("BCI-minus-control post-pre RT changes: two-sided Welch tests; unadjusted p values.")
+    print("Negative estimates indicate a larger RT decrease in BCI; CIs are pointwise 95% intervals.")
+    print(welch_tests.to_string(index=False, float_format=lambda value: f"{value:.9g}"))
+    return {"change_scores": change_scores, "welch_tests": welch_tests,
+            "input_data": data, "correction": "None; unadjusted p values"}
+
+
 def summarize_stroop_rt_change_scores(df, tolerance_ms=1e-8):
     """Compute validated post-minus-pre Stroop RT changes by congruency.
 
-    This reuses the exact Analysis 3 correct-trial inclusion, run-level pooled
+    This reuses the exact Analysis 3 correct-trial inclusion, participant-session pooled
     +/-3 SD outlier filtering, and participant-session-condition aggregation.
     Negative values indicate faster post-intervention reaction times.
     """
@@ -3263,44 +3699,11 @@ def summarize_stroop_rt_change_scores(df, tolerance_ms=1e-8):
             f"{agreement.to_string(index=False)}"
         )
 
-    welch_rows = []
-    for trial_type in ["congruent", "incongruent"]:
-        subset = change_scores[change_scores["trial_type"] == trial_type]
-        bci_values = subset.loc[
-            subset["group"] == "experimental", "rt_change_ms"
-        ].to_numpy()
-        control_values = subset.loc[
-            subset["group"] == "control", "rt_change_ms"
-        ].to_numpy()
-        if len(bci_values) < 2 or len(control_values) < 2:
-            raise ValueError(
-                f"Welch test for {trial_type} requires at least two participants per group."
-            )
-        statistic, p_value = stats.ttest_ind(
-            bci_values, control_values, equal_var=False
-        )
-        ci_low, ci_high = _welch_mean_difference_ci(bci_values, control_values)
-        welch_rows.append({
-            "trial_type": trial_type,
-            "comparison": "BCI - Mental Rehearsal RT change",
-            "n_bci": len(bci_values),
-            "n_mental_rehearsal": len(control_values),
-            "bci_mean_rt_change_ms": float(np.mean(bci_values)),
-            "mental_rehearsal_mean_rt_change_ms": float(np.mean(control_values)),
-            "estimate_ms": float(np.mean(bci_values) - np.mean(control_values)),
-            "statistic": statistic,
-            "df": _welch_df(bci_values, control_values),
-            "p_value": p_value,
-            "effect_size": _cohens_d_independent(bci_values, control_values),
-            "effect_size_label": "cohens_d",
-            "ci95_low_ms": ci_low,
-            "ci95_high_ms": ci_high,
-        })
-    welch_tests = pd.DataFrame(welch_rows)
+    welch_tests = compare_stroop_rt_changes_by_congruency(subject_session_summary)["welch_tests"]
 
     print("STROOP RT CHANGE-SCORE SANITY CHECKS")
     print(f"  Source rows: {len(df)}")
-    print(f"  Retained correct-trial RTs after run-level filtering: {len(trial_data_clean)}")
+    print(f"  Retained correct-trial RTs after participant-session filtering: {len(trial_data_clean)}")
     print("  Subject counts by group and congruency:")
     print(subject_counts.to_string(index=False))
     print("  Change-score agreement with primary Analysis 3 endpoint means:")
@@ -3376,7 +3779,11 @@ def load_and_plot_stroop_rt_change_barplot(csv_path=None, save_figure=True):
 
 
 def analyze_accuracy_and_timeout(summary_df):
-    """ANALYSIS 2: Compute accuracy and timeout metrics with plots and statistics.
+    """Historical Analysis 2: unfiltered accuracy and timeout plots/statistics.
+
+    For current RT-filtered condition accuracy, use
+    analyze_training_accuracy_mixed_anova() on the original corrected trials.
+    This legacy API has no trial RTs and cannot apply the 150-ms exclusion.
 
     Parameters
     ----------
@@ -3431,65 +3838,15 @@ def analyze_accuracy_and_timeout(summary_df):
     print("STATISTICAL ANALYSES")
     print("=" * 80)
 
-    # 1. Accuracy (trial type) → 3-way ANOVA: Time × Trial Type × Group
-    print("\n--- Accuracy by Trial Type: 3-Way ANOVA (Time × Trial Type × Group) ---")
-    acc_cond_wide = accuracy_by_condition.pivot_table(
-        index=['subject_id', 'group'],
-        columns=['session', 'trial_type'],
-        values='accuracy'
+    # Preserve historical unfiltered accuracy summaries, but use the proper
+    # repeated-measures error strata for every reported inferential test.
+    result['stats_accuracy'] = run_training_accuracy_mixed_anova(accuracy_by_condition)
+    result['stats_overall_accuracy'] = run_behavioral_prepost_mixed_anova(
+        overall_accuracy, value_col="accuracy", outcome_label="Overall accuracy (unfiltered)",
     )
-    
-    # Prepare data for ANOVA: factors are session (pre/post), trial_type (distractor/no_distractor), group (control/experimental)
-    anova_data_accuracy = accuracy_by_condition.copy()
-    anova_data_accuracy['session_factor'] = anova_data_accuracy['session'].map({'pre': 0, 'post': 1})
-    anova_data_accuracy['trial_type_factor'] = anova_data_accuracy['trial_type'].map({'no_distractor': 0, 'distractor': 1})
-    anova_data_accuracy['group_factor'] = anova_data_accuracy['group'].map({'control': 0, 'experimental': 1})
-    
-    # Run 3-way ANOVA
-    model_accuracy = ols('accuracy ~ C(session_factor) * C(trial_type_factor) * C(group_factor)', 
-                         data=anova_data_accuracy).fit()
-    anova_table_accuracy = anova_lm(model_accuracy, typ=2)
-    
-    print(anova_table_accuracy)
-    result['stats_accuracy'] = {
-        'model': model_accuracy,
-        'anova_table': anova_table_accuracy,
-        'r_squared': model_accuracy.rsquared
-    }
-
-    # 2. Overall Accuracy → 2-way ANOVA: Time × Group
-    print("\n--- Overall Accuracy: 2-Way ANOVA (Time × Group) ---")
-    anova_data_overall = overall_accuracy.copy()
-    anova_data_overall['session_factor'] = anova_data_overall['session'].map({'pre': 0, 'post': 1})
-    anova_data_overall['group_factor'] = anova_data_overall['group'].map({'control': 0, 'experimental': 1})
-    
-    model_overall = ols('accuracy ~ C(session_factor) * C(group_factor)', 
-                        data=anova_data_overall).fit()
-    anova_table_overall = anova_lm(model_overall, typ=2)
-    
-    print(anova_table_overall)
-    result['stats_overall_accuracy'] = {
-        'model': model_overall,
-        'anova_table': anova_table_overall,
-        'r_squared': model_overall.rsquared
-    }
-
-    # 3. Timeout Rate → 2-way ANOVA: Time × Group
-    print("\n--- Timeout Rate: 2-Way ANOVA (Time × Group) ---")
-    anova_data_timeout = timeout_rate.copy()
-    anova_data_timeout['session_factor'] = anova_data_timeout['session'].map({'pre': 0, 'post': 1})
-    anova_data_timeout['group_factor'] = anova_data_timeout['group'].map({'control': 0, 'experimental': 1})
-    
-    model_timeout = ols('timeout_rate ~ C(session_factor) * C(group_factor)', 
-                        data=anova_data_timeout).fit()
-    anova_table_timeout = anova_lm(model_timeout, typ=2)
-    
-    print(anova_table_timeout)
-    result['stats_timeout'] = {
-        'model': model_timeout,
-        'anova_table': anova_table_timeout,
-        'r_squared': model_timeout.rsquared
-    }
+    result['stats_timeout'] = run_behavioral_prepost_mixed_anova(
+        timeout_rate, value_col="timeout_rate", outcome_label="Timeout rate",
+    )
 
     # === FIGURES ===
     print("\n" + "=" * 80)
@@ -3556,7 +3913,8 @@ def analyze_distractor_cost(df):
     )
     subject_session_exclusion_report["total_removed_before_sd"] = (
         subject_session_exclusion_report["n_removed_non_correct"] +
-        subject_session_exclusion_report["n_removed_rt_lt_150"]
+        subject_session_exclusion_report["n_removed_rt_lt_150"] +
+        subject_session_exclusion_report["n_removed_missing_rt"]
     )
     subject_session_exclusion_report["total_removed_all_filters"] = (
         subject_session_exclusion_report["total_removed_before_sd"] +
@@ -3568,6 +3926,10 @@ def analyze_distractor_cost(df):
     )
     subject_session_exclusion_report["percent_removed_rt_lt_150"] = (
         subject_session_exclusion_report["n_removed_rt_lt_150"] /
+        subject_session_exclusion_report["n_total_trials"] * 100.0
+    )
+    subject_session_exclusion_report["percent_removed_missing_rt"] = (
+        subject_session_exclusion_report["n_removed_missing_rt"] /
         subject_session_exclusion_report["n_total_trials"] * 100.0
     )
     subject_session_exclusion_report["percent_removed_before_sd"] = (
@@ -3746,6 +4108,7 @@ def _print_distractor_cost_checks(
         "n_total_trials",
         "percent_removed_non_correct",
         "percent_removed_rt_lt_150",
+        "percent_removed_missing_rt",
         "percent_outliers_removed",
         "percent_removed_all_filters",
     ]
@@ -3763,6 +4126,10 @@ def _print_distractor_cost_checks(
             f"{row['percent_removed_rt_lt_150_sem']:.2f}%"
         )
         print(
+            f"  missing correct-trial RT = {row['percent_removed_missing_rt_mean']:.2f}% ± "
+            f"{row['percent_removed_missing_rt_sem']:.2f}%"
+        )
+        print(
             f"  SD outliers = {row['percent_outliers_removed_mean']:.2f}% ± "
             f"{row['percent_outliers_removed_sem']:.2f}%"
         )
@@ -3772,33 +4139,11 @@ def _print_distractor_cost_checks(
         )
 
 
-def _run_distractor_cost_anova(subject_session_cost):
-    """Run a subject-adjusted two-factor ANOVA on distractor cost."""
-    anova_data = subject_session_cost.copy()
-    formula = "distractor_cost_ms ~ C(subject_id) + C(group) * C(session)"
-    model = ols(formula, data=anova_data).fit()
-    anova_table = anova_lm(model, typ=2)
-
-    residual_ss = anova_table.loc["Residual", "sum_sq"]
-    anova_report = anova_table.reset_index().rename(columns={"index": "effect"})
-    anova_report["partial_eta_sq"] = np.where(
-        anova_report["effect"] != "Residual",
-        anova_report["sum_sq"] / (anova_report["sum_sq"] + residual_ss),
-        np.nan,
+def _run_distractor_cost_anova(summary_df):
+    """Run Group x Session mixed ANOVA with participant-specific error strata."""
+    return run_behavioral_prepost_mixed_anova(
+        summary_df, value_col="distractor_cost_ms", outcome_label="Distractor cost",
     )
-
-    print(
-        "Distractor-cost ANOVA is implemented with a subject-adjusted OLS model "
-        "(subject fixed effects + Time x Group)."
-    )
-    print(anova_report.to_string(index=False))
-
-    return {
-        "model": model,
-        "anova_table": anova_table,
-        "anova_report": anova_report,
-        "r_squared": model.rsquared,
-    }
 
 
 def _run_distractor_cost_posthocs(subject_session_cost):

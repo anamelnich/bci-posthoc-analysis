@@ -40,7 +40,8 @@ Each `.gdf` file contains:
 - `Label` (channel labels)
 
 ### Important note
-- All trigger events are present in the **Status channel (channel 67)**
+- Recorded trigger events are stored in the **Status channel (channel 67)**;
+  a trigger request logged to text is not proof of hardware delivery.
 - For EEG epoching in training/decoding, use stimulus-presentation Status
   triggers `8`, `32`, and `44` as time 0. Do not use fixation trigger `4` as
   the default trial-start anchor for ERP/Pd analyses.
@@ -92,13 +93,21 @@ Each `.gdf` file contains:
 ### Columns
 1. trial number
 2. trigger type
-3. time (in samples)
+3. time (in milliseconds, `pygame.time.get_ticks()`)
 
 ### Notes
-- Same trigger information is also present in `.gdf` Status channel
-- Timing values are in **samples (not milliseconds)**. The trigger-text time
-  clock may differ from the GDF Status clock; use Status-event samples for EEG
-  epoching after verifying condition/order alignment.
+- Text logs attempted triggers; hardware transmission can fail even though
+  an event was logged. The 47 missing training responses are documented in
+  [training_response_qc.md](training_response_qc.md).
+- Training trigger-text timestamps are **milliseconds**, not EEG samples.
+  Text-only RT is response minus stimulus time without conversion. Use GDF
+  Status-event samples for primary training RT and EEG epoching, after verifying
+  trial count, condition/order alignment, and the 512 Hz recording rate.
+- Missing GDF responses produce NaN in `gdf_rt_ms`. Consolidation explicitly
+  fills analysis `rt_ms` from aligned text RT only when no GDF response exists
+  and text RT is <50 ms; source is `trigger_text_fallback`. This supports
+  <150 ms reporting without changing the retained RT sample. Multiple
+  responses remain alignment errors with NaN RT; sample indices are never filled.
 
 ---
 
@@ -187,9 +196,9 @@ Each `.gdf` file contains:
 
 ## 7. Units and Timing
 
-- Trigger timing values are in **samples**, not milliseconds. Use GDF Status
-  event samples for EEG timing; trigger-text timestamps may use a different
-  sampling clock.
+- Training trigger-text timing values are **milliseconds**. GDF Status events
+  are **sample indices**. Keep the two clocks explicit; only GDF sample
+  differences require division by the recording sampling rate.
 - Behavioral reaction times (e.g., in Stroop files) are in **milliseconds**.
 - To convert GDF Status samples to time:
   - `time (seconds) = samples / fsamp`

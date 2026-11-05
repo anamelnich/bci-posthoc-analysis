@@ -1279,3 +1279,18 @@ The notebook or script should produce:
 - Subject exclusion is based only on mean congruent accuracy across pre/post.
 - All data issues should produce warnings, not errors.
 - Functions should keep running whenever possible.
+
+
+## Rerun audit correction (2026-11-05): fallback Session error term
+
+When Pingouin is unavailable, `run_color_shape_mixed_anova()` now tests the
+participant-weighted marginal Session change against within-group change
+variance with N−2 residual df, matching the Group × Session error stratum.
+The former one-sample t fallback used pooled change variance and N−1 df,
+which is not the mixed-design Session test. Group and interaction tests,
+25 participants (13 BCI/12 control), exclusions, means and figures are
+unchanged. Corrected Session p values: accuracy congruent 0.0107614,
+accuracy incongruent 0.533078, RT congruent 0.000348530 and RT incongruent
+0.00366304. No nominal significance conclusion changes. Results and
+independent contrast-regression verification are recorded under
+`analyses/qc/rerun_2026-11-05/behavior_bci/`.

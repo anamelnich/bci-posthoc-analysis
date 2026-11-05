@@ -205,7 +205,7 @@ def _validate_decoder_struct(decoder, struct_name, filepath, expected_subject_id
             f"not one of {DECODER_TYPES}."
         )
 
-    classes = np.asarray(getattr(decoder, "Classes", []), dtype=int).reshape(-1)
+    classes = np.asarray(getattr(decoder, "Classes", []), dtype=float).reshape(-1)
     if classes.size and classes.tolist() != [0, 1]:
         raise ValueError(
             f"{filepath} has unexpected Classes {classes.tolist()}; expected [0, 1]."
@@ -220,7 +220,7 @@ def _validate_decoder_struct(decoder, struct_name, filepath, expected_subject_id
         )
     if labels.size == 0:
         raise ValueError(f"performance.labels is empty in {filepath}.")
-    invalid_labels = sorted(set(labels.astype(int).tolist()) - {0, 1})
+    invalid_labels = labels[~np.isin(labels, [0.0, 1.0])].tolist()
     if invalid_labels:
         raise ValueError(
             f"performance.labels must contain only 0/1 classes in {filepath}; "
@@ -233,12 +233,23 @@ def _validate_decoder_struct(decoder, struct_name, filepath, expected_subject_id
             f"performance.posteriors must be probabilities within [0, 1] in {filepath}."
         )
 
-    n_trials = int(np.asarray(getattr(performance, "nTrials", labels.size)).reshape(-1)[0])
+    n_trials_value = _as_float(getattr(performance, "nTrials", labels.size), "nTrials", filepath)
+    if n_trials_value != int(n_trials_value):
+        raise ValueError(f"performance.nTrials must be an integer in {filepath}: {n_trials_value}.")
+    n_trials = int(n_trials_value)
     if n_trials <= 0 or n_trials > labels.size:
         raise ValueError(
             f"performance.nTrials should be positive and no larger than labels length "
             f"in {filepath}; got nTrials={n_trials}, labels={labels.size}."
         )
+
+    # file_id describes the pruned training subset; evaluation labels and
+    # posteriors describe all held-out trials and need not have that length.
+    if hasattr(performance, "file_id"):
+        file_id = np.asarray(performance.file_id, dtype=float).reshape(-1)
+        if (file_id.size != n_trials or not np.isfinite(file_id).all()
+                or not np.equal(file_id, np.floor(file_id)).all() or (file_id < 1).any()):
+            raise ValueError(f"performance.file_id must contain {n_trials} positive integer run IDs in {filepath}.")
 
     tpr = _as_float(performance.tpr, "tpr", filepath)
     tnr = _as_float(performance.tnr, "tnr", filepath)
@@ -455,7 +466,7 @@ def plot_decoder_rl_performance_by_group(
     metrics = [
         ("tpr", "TPR"),
         ("tnr", "TNR"),
-        ("balanced_offline_accuracy", "Balanced accuracy"),
+        ("balanced_offline_accuracy", "Balanced\naccuracy"),
     ]
     group_order = ["control", "bci"]
     labels = {

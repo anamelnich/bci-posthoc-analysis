@@ -15,11 +15,13 @@ The canonical study root is configured as `PROJECT_ROOT`:
 `/Users/hililbby/Library/CloudStorage/Box-Box/CNBI/Attention_distraction/project_healthy`
 
 Its `analyses/` directory is the primary location for shared, precomputed
-study outputs. For example, the group Pd waveform source file is:
+study outputs, including the corrected `all_subjects_training.csv` trial table.
 
-`PROJECT_ROOT/analyses/training_session_condition_eeg_averages.csv`
-
-Use this location by default for downstream analysis and figure generation.
+Current Pd analyses use the explicitly configured repository cache
+`analyses/eeg_pd/behavior_filtered/subject_session_pd.csv` together with its
+trial-exclusion audit and provenance. The study-root
+`training_session_condition_eeg_averages.csv` is a retired unfiltered artifact,
+not a source for current Pd figures or statistics.
 
 ### Analysis repository
 
@@ -41,9 +43,10 @@ Before recomputing an analysis from raw files:
 4. Only then regenerate from raw recordings, and print the reason that
    regeneration was necessary.
 
-For `training_session_condition_eeg_averages.csv`,
-`resolve_training_condition_eeg_averages_csv()` implements this order and
-prints the selected path.
+For filtered Pd, `rebuild_behavior_filtered_pd()` checks an explicit cache
+directory first; otherwise it checks study-root and then repository caches.
+It validates provenance and outputs before reuse. The current notebook passes
+the repository `analyses/eeg_pd/behavior_filtered/` directory explicitly.
 
 ## Output policy
 
@@ -57,3 +60,31 @@ prints the selected path.
 - Avoid creating duplicate raw-data-derived CSVs in the repository solely to
   make a figure when a validated precomputed source is available.
 - If a file is not found, report every location checked in the error message.
+
+## Training RT clock correction
+
+Legacy `all_subjects_training.csv` files with text-derived `rt_samples` and
+`rt_ms = rt_samples / 512 * 1000` are not validated RT sources. Regeneration
+from non-practice GDF Status is required even if such a CSV exists. Corrected
+outputs preserve `gdf_rt_ms` and label `rt_source = gdf_status` or the explicit
+`trigger_text_fallback` for absent responses with aligned text RT <50 ms.
+Text milliseconds remain in `text_rt_ms` without sample-rate conversion.
+Validated GDF-only trial tables may be upgraded with
+`apply_training_text_rt_fallback()`; no rescaling or new EEG/Stroop computation
+is required. See `training_response_qc.md` for the audited fallback pattern.
+
+## Seven-point Pd trajectory cache
+
+The notebook explicitly uses repository `analyses/eeg_pd/seven_point/` for
+expensive decoding-session sensor Pd waveforms. There was no precomputed
+five-session Pd waveform source at the canonical study-root or repository
+locations. The existing filtered pre/post cache is reused unchanged. See
+`analyses.md` for cache provenance and the approved raw-run exceptions.
+
+## Consolidated theta reference
+
+The posterior-theta reference now defaults to the repository-local
+`exploratory_results/theta_paper_reproduction/`; no Codex worktree is required.
+`PD_THETA_REFERENCE_ROOT` remains an optional explicit override. Historical
+absolute paths in cache manifests identify original provenance; loaders resolve
+run checkpoints locally and still validate the recorded checksums.

@@ -18,10 +18,10 @@ Do NOT use this file for:
 - Triggers are stored in:
   - `.triggers.txt` files
   - EEG `.gdf` files in the **Status channel (channel 67)**
-- Timing values are in **samples**, not milliseconds. The trigger-text clock
-  can differ from the 512 Hz GDF Status clock (in Session 5 validation it was
-  approximately 1000 Hz versus 512 Hz). Use GDF Status samples—not
-  trigger-text times—to slice EEG epochs.
+- Training `.triggers.txt` times are **milliseconds** from
+  `pygame.time.get_ticks()`. They are not EEG sample indices.
+- GDF `Status` events use the recording's sample clock (verify **512 Hz**).
+  Use GDF Status samples to compute primary training RT and slice EEG epochs.
 - To convert a GDF Status sample to time:
   `time (seconds) = samples / fsamp`
 
@@ -41,7 +41,8 @@ These codes are used in training and decoding tasks:
 
 ## 3. Trial Structure: Training and Decoding
 
-Each trial consists of **3 triggers** in sequence:
+Each trial logs **3 trigger requests** in sequence (hardware delivery is
+separate and must be checked against GDF Status):
 
 1. **Fixation**
    - trigger = 4
@@ -90,19 +91,43 @@ Only relevant for distractor trials:
 
 ## 6. Computing Reaction Time (RT)
 
-RT is computed using trigger timestamps:
+Primary training RT is reconstructed from non-practice `*_training.gdf` files:
 
-- Identify:
-  - stimulus trigger (8, 32, or 44)
-  - response trigger (64)
+```python
+events = mne.find_events(raw, stim_channel="Status", shortest_event=1, verbose="ERROR")
+assert raw.info["sfreq"] == 512
+```
 
-- Compute:
+- Stimulus onset is code **8, 32, or 44**, never fixation code 4.
+- For each stimulus, search for code 64 strictly after that sample and strictly
+  before the next stimulus (recording end for the final trial).
+- Exactly one response: `rt_ms = (response_sample - stimulus_sample) / sfreq * 1000`.
+- The GDF extractor returns NaN without a response. Multiple responses flag
+  an alignment error and remain NaN. Consolidation preserves the extractor's
+  result in `gdf_rt_ms` before applying the explicit exception below.
+- Align GDF, `.triggers.txt`, and `.analysis.txt` by subject/session/run/trial.
+  Require 60 stimuli, counts **30 code 8 / 15 code 32 / 15 code 44**, identical
+  stimulus order, and agreement with analysis task/distractor position.
+- Correct responses are `feedback == 1`.
 
-`RT (samples) = time_response - time_stimulus`
+Text-only RT is `response_time - stimulus_time`, already in **milliseconds**.
+`compute_training_reaction_times_gdf()` supplies the GDF-only training RT and
+retains text-only RT in `text_rt_ms`. Consolidation then calls
+`apply_training_text_rt_fallback()`: absent GDF responses with aligned text
+RT in [0, 50) ms receive that value in analysis `rt_ms`, labeled
+`rt_source = trigger_text_fallback`. The GDF-only `gdf_rt_ms`, `rt_samples`,
+and `response_sample` stay NaN. This explicit exception covers the audited
+47 trigger-lockout cases and allows them to contribute to <150 ms reporting.
+No ambiguous response or missing-file/alignment failure receives a fallback;
+other absent responses remain NaN. The obsolete
+standalone text-RT and single-run 2-SD preview helpers have been removed.
 
-- Convert to milliseconds (fsamp=512):
-
-`RT (ms) = (RT_samples / fsamp) * 1000`
+The former calculation divided text milliseconds by 512 and multiplied by
+1000, inflating RT by **1.953125**. Its `rt_samples` label was incorrect.
+Example: GDF 3813→4081 gives **523.4375 ms**; text difference **522 ms**;
+legacy saved RT **1019.53125 ms**. Rebuild trial outputs and rerun cleaning and
+summaries, rather than rescaling cleaned averages. Stroop `.behoutput.txt`
+verbal-response RTs are already milliseconds and are unchanged.
 
 ---
 
@@ -157,7 +182,10 @@ Each trial has **2 triggers**:
 - Pattern must follow:
   - 4 → (8 / 32 / 44) → 64
 
-If this pattern breaks, data may be corrupted or misaligned.
+This grouping applies to the text log. Do not group GDF events in fixed
+triplets: a logged response request can be rejected by the hardware driver.
+The training audit found 47 such absent responses, all with text RT below
+50 ms; see [training_response_qc.md](training_response_qc.md).
 
 For stimulus-locked EEG epoching, the required Status-channel anchors are the
 60 stimulus events (`8`, `32`, or `44`). If a response event (`64`) is missing
@@ -220,4 +248,5 @@ Triggers encode:
 - distractor side
 - timing for RT computation
 
-They are the **ground truth timing source** for all event-based analyses.
+GDF Status is the timing source for EEG and primary training RT. Text timing
+is a separate millisecond clock; Stroop RT comes from `.behoutput.txt`.

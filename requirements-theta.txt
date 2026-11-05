@@ -1,0 +1,12 @@
+# Runtime used to reproduce notebooks/theta_midline_paper.ipynb.
+# Install in a dedicated environment and register its kernel as pd_ai.
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.15.3
+mne==1.12.1
+matplotlib==3.10.8
+statsmodels==0.14.6
+scikit-learn==1.7.2
+pyarrow==25.0.1
+ipykernel==7.2.0
+jupyter_client==8.8.0

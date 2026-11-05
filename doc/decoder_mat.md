@@ -193,11 +193,19 @@ Important interpretations:
 
 - `performance.posteriors` = offline cross-validated evaluation posteriors
 - `performance.labels` aligns one-to-one with `performance.posteriors`
-- `performance.file_id` indexes specific runs used in training/evaluation
+- `performance.file_id` indexes runs for the retained/pruned training trials and has length `performance.nTrials`; it does not align with the full evaluation posterior vector.
 - `performance.nTrials` = number of retained trials after pruning
 - `performance.history` is always present
-- `performance.acc` and `performance.accuracy` are redundant summary fields
-- `performance.thr` and `performance.threshold` are redundant summary fields
+- `performance.acc` and `performance.accuracy` are **not interchangeable** in the saved files.
+- `performance.thr` and `performance.threshold` are **not interchangeable**.
+- The 2026-11-05 audit independently reproduced saved `performance.tpr` and
+  `performance.tnr` from `posteriors >= performance.thr` against `labels`.
+  The other threshold often gives different results. Retain the field identity;
+  do not substitute `threshold` for `thr` or infer undocumented historical roles.
+- `labels` and `posteriors` span the full cross-validation evaluation set;
+  their length can exceed `nTrials`. For example, e21 decoderR has 360
+  evaluation labels/posteriors and 131 retained trial IDs. These are distinct
+  index spaces, so never zip `file_id` with the full posterior array.
 
 ---
 

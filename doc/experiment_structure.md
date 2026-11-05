@@ -110,8 +110,8 @@ Each of these sessions includes:
 
 - `e30` Session 1 has only **7 non-practice training runs** instead of the
   expected 8.
-  - For session-level EEG condition averages, report the mismatch and average
-    across the 7 available run-level averages.
+  - For current behavior-filtered Pd, report the mismatch and pool retained
+    distractor trials across the 7 available runs with equal trial weighting.
   - Keep `n_runs` and `expected_n_runs` in output manifests so the incomplete
     session is explicit in downstream analyses.
 - `e27` Session 1 completed only **5 decoding runs total, including practice**.

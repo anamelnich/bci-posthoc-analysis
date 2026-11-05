@@ -2790,6 +2790,18 @@ def load_session5_frozen_feature_reference(subject_id, decoder_side, output_dir=
         missing = required.difference(archive.files)
         if missing:
             raise ValueError(f"{transform_path.name} is missing fields {sorted(missing)}.")
+        if (archive["artifact_version"].shape != (1,)
+                or archive["artifact_version"][0] != 1
+                or archive["subject_id"].shape != (1,)
+                or archive["decoder_side"].shape != (1,)):
+            raise ValueError(f"{transform_path.name}: invalid artifact version or identity fields.")
+        for name in ("feature_window_indices", "resampled_indices", "selected_indices_zero_based"):
+            values = archive[name]
+            if (values.ndim != 1 or values.size == 0
+                    or not np.issubdtype(values.dtype, np.number)
+                    or not np.isfinite(values).all()
+                    or not np.equal(values, np.round(values)).all()):
+                raise ValueError(f"{transform_path.name}: {name} must be a finite integer vector.")
         saved_subject = str(archive["subject_id"][0]).lower()
         saved_side = str(archive["decoder_side"][0]).lower()
         if saved_subject != subject_id or saved_side != decoder_side:
@@ -2806,6 +2818,21 @@ def load_session5_frozen_feature_reference(subject_id, decoder_side, output_dir=
             "epoch_time_s": np.asarray(archive["epoch_time_s"], dtype=float),
             "difference_channel_labels": archive["difference_channel_labels"].astype(str).tolist(),
         }
+    for name in ("xdawn_filters_components_by_channels", "normalization_means",
+                 "normalization_stds", "epoch_time_s"):
+        if not np.isfinite(reference[name]).all():
+            raise ValueError(f"{transform_path.name}: nonfinite {name}.")
+    expected_time = np.arange(768) / 512 - 0.5
+    if (reference["epoch_time_s"].shape != expected_time.shape
+            or not np.allclose(reference["epoch_time_s"], expected_time, rtol=0, atol=1e-12)):
+        raise ValueError(f"{transform_path.name}: expected 768 epoch samples at 512 Hz from -0.5 s.")
+    expected_channels = [f"{right}-{left}" for right, left in CONVENTIONAL_PPO_PAIRS]
+    if reference["difference_channel_labels"] != expected_channels:
+        raise ValueError(f"{transform_path.name}: conventional P/PO difference-channel order mismatch.")
+    expected_window = np.flatnonzero(expected_time >= 0.2)
+    if (not np.array_equal(reference["feature_window_indices"], expected_window)
+            or not np.array_equal(reference["resampled_indices"], expected_window[::8])):
+        raise ValueError(f"{transform_path.name}: expected 200-ms-to-final-sample window and stride 8.")
     if reference["xdawn_filters_components_by_channels"].shape != (2, 7):
         raise ValueError(f"{transform_path.name} has unexpected xDAWN shape.")
     n_candidates = 2 * len(reference["resampled_indices"])
@@ -2816,11 +2843,23 @@ def load_session5_frozen_feature_reference(subject_id, decoder_side, output_dir=
         raise ValueError(f"{transform_path.name} normalization dimensions do not match its resampling indices.")
     if np.any(reference["normalization_stds"] <= 0):
         raise ValueError(f"{transform_path.name} contains non-positive normalization standard deviations.")
+    selected = reference["selected_indices_zero_based"]
+    if (selected.shape != (30,) or len(np.unique(selected)) != 30
+            or np.any(selected < 0) or np.any(selected >= n_candidates)):
+        raise ValueError(f"{transform_path.name}: expected 30 unique in-range feature indices.")
     top30 = pd.read_parquet(top30_path)
+    required_columns = {"subject_id", "decoder_side", "rank", "feature_index_zero_based"}
+    if required_columns.difference(top30.columns):
+        raise ValueError(f"{top30_path.name}: missing columns {sorted(required_columns.difference(top30.columns))}.")
     selected_coordinates = top30.loc[
         (top30["subject_id"].astype(str).str.lower() == subject_id)
         & (top30["decoder_side"] == decoder_side)
     ].sort_values("rank").reset_index(drop=True)
+    if (not np.array_equal(selected_coordinates["rank"].to_numpy(), np.arange(1, 31))
+            or not np.isfinite(selected_coordinates["feature_index_zero_based"]).all()
+            or not np.equal(selected_coordinates["feature_index_zero_based"],
+                            selected_coordinates["feature_index_zero_based"].round()).all()):
+        raise ValueError(f"{subject_id} {decoder_side}: invalid ranks or non-integer feature coordinates.")
     if len(selected_coordinates) != 30 or not np.array_equal(
         selected_coordinates["feature_index_zero_based"].to_numpy(dtype=int),
         reference["selected_indices_zero_based"],
@@ -3734,7 +3773,8 @@ def plot_longitudinal_top30_r2_by_session(
         axes[0].set_ylabel(f"Mean r² across frozen top-{n_features} features")
         axes[1].legend(frameon=False, loc="upper left", handlelength=1.7)
         fig.text(0.50, 0.01,
-                 "Lines and shading, group mean ± SEM across participants (n = 16/group).",
+                 "Lines and shading, group mean ± SEM across participants (n = 16/group).\n"
+                 "Post-training is selection-linked; intervention days are the independent evaluation.",
                  ha="center", va="bottom", fontsize=6.3)
         fig.subplots_adjust(left=0.11, right=0.99, bottom=0.24, top=0.88, wspace=0.18)
         pdf_path = output_dir / f"{filename_stem}.pdf"
@@ -3866,7 +3906,8 @@ def plot_longitudinal_top30_r2_combined_decoders(
         ax.legend(frameon=False, loc="upper left", handlelength=1.7)
         ax.text(-0.13, 1.02, "a", transform=ax.transAxes, fontsize=9, fontweight="bold", va="bottom")
         fig.text(0.50, 0.01,
-                 "Lines and shading, group mean ± SEM across participants (n = 16/group).",
+                 "Lines and shading, group mean ± SEM across participants (n = 16/group).\n"
+                 "Post-training is selection-linked; intervention days are the independent evaluation.",
                  ha="center", va="bottom", fontsize=6.3)
         fig.subplots_adjust(left=0.17, right=0.99, bottom=0.25, top=0.95)
         pdf_path = output_dir / f"{filename_stem}.pdf"

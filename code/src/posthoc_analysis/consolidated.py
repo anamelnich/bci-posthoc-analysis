@@ -4,7 +4,11 @@ from pathlib import Path
 import pandas as pd
 
 from .config import PROJECT_ROOT, BCI_GROUP_SUBJECTS, CONTROL_GROUP_SUBJECTS
-from .triggers import load_training_trigger_file, validate_training_triggers
+from .triggers import (
+    apply_training_text_rt_fallback,
+    load_training_trigger_file, validate_training_triggers,
+    compute_training_reaction_times_gdf,
+)
 from .analysis import load_training_analysis_file, validate_training_analysis
 
 
@@ -592,7 +596,7 @@ def validate_all_training_files(root_path=None):
             ])
             
             # Validate file counts for this session
-            expected_runs = 8 if session_number == 1 else 4
+            expected_runs = {1: 8, 5: 4}.get(session_number, 0)
             if len(training_run_folders) != expected_runs:
                 validation_results['issues']['file_count_mismatches'].append({
                     'subject_id': subject_id,
@@ -704,13 +708,13 @@ def _validate_trigger_file(trigger_file_path, run_id):
         if not df['time'].dtype.kind in 'iu':  # integer or unsigned int
             issues.append({
                 'file': str(trigger_file_path),
-                'issue': 'Time column should contain integers (samples)'
+                'issue': 'Time column should contain integer millisecond timestamps'
             })
         
         if (df['time'] <= 0).any():
             issues.append({
                 'file': str(trigger_file_path),
-                'issue': 'Time values should be positive (samples from start of recording)'
+                'issue': 'Time values should be positive (pygame millisecond ticks)'
             })
         
     except Exception as e:
@@ -907,46 +911,20 @@ def load_and_merge_training_run(run_info):
     trigger_file = run_info['trigger_file']
     analysis_file = run_info['analysis_file']
     
-    # Load files
-    try:
-        triggers_df = load_training_trigger_file(trigger_file)
-    except Exception as e:
-        raise ValueError(f"Failed to load trigger file {trigger_file}: {e}")
-    
-    try:
-        analysis_df = load_training_analysis_file(analysis_file)
-    except Exception as e:
-        raise ValueError(f"Failed to load analysis file {analysis_file}: {e}")
-    
-    # Check trial counts match
-    if len(triggers_df) // 3 != len(analysis_df):
-        raise ValueError(
-            f"Trial count mismatch for {run_info['run_id']}: "
-            f"triggers has {len(triggers_df) // 3} trials, "
-            f"analysis has {len(analysis_df)} trials"
-        )
-    
-    # Compute RT from triggers
-    rt_rows = []
-    for trial, group in triggers_df.groupby("trial", sort=True):
-        stimulus = group.iloc[1]
-        response = group.iloc[2]
-        rt_samples = int(response["time"]) - int(stimulus["time"])
-        rt_ms = (rt_samples / 512.0) * 1000.0
-        
-        rt_rows.append({
-            'trial': int(trial),
-            'rt_samples': rt_samples,
-            'rt_ms': rt_ms,
-        })
-    
-    rt_df = pd.DataFrame(rt_rows)
-    
+    if run_info['task_type'] != 'training' or run_info['session_number'] not in (1, 5):
+        raise ValueError(f"Expected non-practice training in Session 1/5: {run_info['run_id']}")
+    trigger_file = Path(trigger_file)
+    gdf_file = trigger_file.with_name(trigger_file.name.removesuffix('.triggers.txt') + '.gdf')
+    rt_df = apply_training_text_rt_fallback(
+        compute_training_reaction_times_gdf(gdf_file, trigger_file, analysis_file)
+    )
+    analysis_df = load_training_analysis_file(analysis_file)
+
     # Merge: analysis + RT columns
     # Rename trial_index to trial for consistency
     merged = analysis_df.copy()
     merged = merged.rename(columns={'trial_index': 'trial'})
-    merged = merged.merge(rt_df, on='trial', how='left')
+    merged = merged.merge(rt_df, on='trial', how='left', validate='one_to_one')
     
     # Add run-level metadata
     merged['subject_id'] = run_info['subject_id']
@@ -994,6 +972,8 @@ def generate_consolidated_training_csv(output_path=None, root_path=None):
     # Create output directory if needed
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
+    print("Rebuilding training RT from raw GDF Status; explicitly labeled text fallback applies only to absent responses below 50 ms.")
+
     # Collect all runs
     all_runs, collection_issues, subjects_found = collect_all_training_runs(root_path)
     
@@ -1134,6 +1114,15 @@ def generate_consolidated_training_csv(output_path=None, root_path=None):
         print("=" * 70)
         print()
     
+    # Do not silently overwrite a usable table with incomplete GDF reconstruction.
+    if merge_issues['load_errors']:
+        raise ValueError(
+            f"Training RT rebuild failed for {len(merge_issues['load_errors'])} runs; "
+            f"CSV not overwritten. Errors: {merge_issues['load_errors']}"
+        )
+    if len(consolidated) and consolidated.duplicated(['subject_id', 'session_id', 'run_id', 'trial']).any():
+        raise ValueError("Duplicate training trial keys; CSV not overwritten.")
+
     # Save to CSV
     if len(consolidated) > 0:
         # Reorder columns for readability

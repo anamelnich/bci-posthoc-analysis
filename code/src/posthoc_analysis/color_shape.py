@@ -2496,17 +2496,31 @@ def _mixed_anova_fallback_two_by_two(subset, dv, congruency):
         "np2": group_f / (group_f + group_df2) if group_df2 > 0 else np.nan,
     })
 
-    session_t = stats.ttest_1samp(wide["change"], popmean=0, nan_policy="omit")
-    session_df2 = len(wide["change"].dropna()) - 1
-    session_f = float(session_t.statistic ** 2)
+    # Session is the participant-weighted marginal change, with the same
+    # within-group change residual as the Group x Session interaction. A pooled
+    # one-sample t test incorrectly includes between-group change variance and
+    # uses N-1 df rather than the mixed-design N-2 error df.
+    session_df2 = len(wide) - 2
+    change_error_ss = float(
+        ((bci_change - bci_change.mean()) ** 2).sum()
+        + ((control_change - control_change.mean()) ** 2).sum()
+    )
+    if (session_df2 <= 0 or len(bci_change) < 2 or len(control_change) < 2
+            or not np.isfinite(change_error_ss) or change_error_ss <= 0):
+        _warn(f"Undefined within-group change variance for {dv}, {congruency}; skipping ANOVA.")
+        return pd.DataFrame()
+    session_ss = float(len(wide) * wide["change"].mean() ** 2 / 2)
+    session_f = float(2 * session_ss / (change_error_ss / session_df2))
+    print(f"Color/Shape {dv}, {congruency}: Session uses within-group change "
+          f"error df={session_df2}, participant-weighted marginal mean; no extra exclusions.")
     tests.append({
         "Source": "Session",
-        "SS": np.nan,
+        "SS": session_ss,
         "DF1": 1,
         "DF2": session_df2,
         "MS": np.nan,
         "F": session_f,
-        "p-unc": float(session_t.pvalue),
+        "p-unc": float(stats.f.sf(session_f, 1, session_df2)),
         "np2": session_f / (session_f + session_df2) if session_df2 > 0 else np.nan,
     })
 
@@ -2536,7 +2550,7 @@ def _mixed_anova_fallback_two_by_two(subset, dv, congruency):
     anova = pd.DataFrame(tests)
     anova.insert(0, "congruency", congruency)
     anova.insert(0, "dv", dv)
-    anova["method"] = "fallback_2x2_t_equivalent"
+    anova["method"] = "fallback_2x2_mixed_error_strata"
     return anova
 
 
@@ -2547,7 +2561,8 @@ def run_color_shape_mixed_anova(summary_long, dv, label=None):
     the equivalent tests for this 2-group × 2-session design:
 
     - group effect: independent t-test on each subject's pre/post mean
-    - session effect: one-sample t-test on post-pre change scores
+    - session effect: participant-weighted mean change tested against the
+      within-group change residual (N-2 df), matching the mixed-ANOVA stratum
     - interaction: independent t-test on post-pre change scores by group
     """
     if label is None:
@@ -2559,7 +2574,7 @@ def run_color_shape_mixed_anova(summary_long, dv, label=None):
     except ImportError as exc:
         pg = None
         _warn(
-            "pingouin is not installed; using 2x2 t-equivalent fallback for "
+            "pingouin is not installed; using 2x2 mixed-error-strata fallback for "
             f"Color/Shape {label} mixed ANOVA. Original import error: {exc}."
         )
 
